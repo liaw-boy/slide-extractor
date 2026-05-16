@@ -74,12 +74,27 @@ class TestClassifyTransition:
 
     def test_text_shrink_is_transition(self) -> None:
         cfg = sx.ExtractorConfig()
-        a = self._make_sample(tokens={f"t{i}" for i in range(20)}, phash_val=0)
-        # Drastically different pHash + much smaller token set
-        b = self._make_sample(tokens={"a", "b", "c"}, phash_val=int("1" * 64, 2))
+        # Shrink with token overlap that survives the hard-OCR cutoff,
+        # so the "text shrank" path actually fires (not hard-OCR).
+        common = {f"t{i}" for i in range(20)}
+        a = self._make_sample(tokens=common, phash_val=0)
+        b = self._make_sample(
+            tokens={f"t{i}" for i in range(8)},  # subset of A, but small
+            phash_val=int("1" * 64, 2),
+        )
         is_trans, reason = sx.classify_transition(a, b, cfg)
         assert is_trans is True
         assert "shrank" in reason
+
+    def test_hard_jaccard_transition_even_with_low_phash(self) -> None:
+        cfg = sx.ExtractorConfig()
+        # Real-world failure mode: same-template slides → pHash distance is
+        # below threshold, but OCR content is completely different.
+        a = self._make_sample(tokens={f"t{i}" for i in range(20)}, phash_val=0)
+        b = self._make_sample(tokens={f"u{i}" for i in range(20)}, phash_val=4)
+        is_trans, reason = sx.classify_transition(a, b, cfg)
+        assert is_trans is True
+        assert "hard-OCR" in reason
 
     def test_growth_with_subset_is_animation(self) -> None:
         cfg = sx.ExtractorConfig()
@@ -93,9 +108,14 @@ class TestClassifyTransition:
 
     def test_content_change_is_transition(self) -> None:
         cfg = sx.ExtractorConfig()
-        a = self._make_sample(tokens={f"t{i}" for i in range(15)}, phash_val=0)
-        # Same size but disjoint tokens + visual change
-        b = self._make_sample(tokens={f"u{i}" for i in range(15)}, phash_val=int("1" * 32, 2))
+        # Different content but with enough overlap to stay above hard-jaccard
+        # cutoff, so the "content change" (mid-level) path actually fires.
+        shared = {f"t{i}" for i in range(5)}
+        a = self._make_sample(tokens=shared | {f"a{i}" for i in range(10)}, phash_val=0)
+        b = self._make_sample(
+            tokens=shared | {f"b{i}" for i in range(10)},
+            phash_val=int("1" * 32, 2),
+        )
         is_trans, reason = sx.classify_transition(a, b, cfg)
         assert is_trans is True
         assert "content change" in reason

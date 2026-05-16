@@ -46,7 +46,8 @@ DEFAULT_PHASH_THR = 6
 DEFAULT_MIN_DURATION_SEC = 9
 DEFAULT_MIN_TEXT_LEN = 15
 DEFAULT_BRIGHTNESS_MIN = 50
-DEFAULT_SUBSET_THR = 0.85
+DEFAULT_SUBSET_THR = 0.92
+DEFAULT_HARD_JACCARD = 0.20
 DEFAULT_SIZE_RATIO_DROP = 0.6
 DEFAULT_SIZE_RATIO_GROW = 1.3
 DEFAULT_OCR_LANGS = ("ch_tra", "en")
@@ -74,6 +75,7 @@ class ExtractorConfig:
     min_text_len: int = DEFAULT_MIN_TEXT_LEN
     brightness_min: int = DEFAULT_BRIGHTNESS_MIN
     subset_thr: float = DEFAULT_SUBSET_THR
+    hard_jaccard: float = DEFAULT_HARD_JACCARD
     size_ratio_drop: float = DEFAULT_SIZE_RATIO_DROP
     size_ratio_grow: float = DEFAULT_SIZE_RATIO_GROW
     ocr_langs: tuple[str, ...] = DEFAULT_OCR_LANGS
@@ -154,17 +156,28 @@ def classify_transition(
 ) -> tuple[bool, str]:
     """Decide whether (prev → curr) is a real slide transition.
 
-    Rules (empirically tuned, see docs/algorithm.md):
-        1. If pHash distance < threshold: definitely the same slide (visual stable).
-        2. If text size dropped sharply (curr much shorter): real transition.
-        3. If text grew AND old ⊂ new: animation step inside the same slide.
-        4. If old ⊂ new but no growth: ambiguous, treat as same slide.
+    Dual-signal rules (empirically tuned, see docs/algorithm.md):
+        0. HARD OCR signal: jaccard < hard_jaccard → real transition regardless of
+           pHash. Some lecture templates produce near-zero pHash distance even
+           across completely different slides (identical colour-band layout).
+        1. If pHash distance < threshold AND OCR overlap healthy: same slide.
+        2. If text size dropped sharply: real transition (animations never remove).
+        3. If text grew AND old ⊂ new (tight subset): animation step.
+        4. If old ⊂ new (looser) but no growth: same slide.
         5. Otherwise (visual change + content really differs): real transition.
     """
+    a, b = prev.tokens, curr.tokens
     ph_dist = curr.phash - prev.phash
+    # Compute OCR signals up-front so the hard-jaccard rule can fire even when
+    # the visual signal is misleading (same-template slides → low pHash).
+    jac = 0.0
+    if a and b:
+        inter = a & b
+        jac = len(inter) / len(a | b)
+        if jac < cfg.hard_jaccard:
+            return True, f"pH={ph_dist} hard-OCR jac={jac:.2f}"
     if ph_dist < cfg.phash_thr:
         return False, f"pH={ph_dist}<{cfg.phash_thr}"
-    a, b = prev.tokens, curr.tokens
     if not a or not b:
         return True, f"pH={ph_dist} (missing OCR)"
     inter = a & b
