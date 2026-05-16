@@ -50,6 +50,7 @@ DEFAULT_SUBSET_THR = 0.92
 DEFAULT_HARD_JACCARD = 0.20
 DEFAULT_SIZE_RATIO_DROP = 0.6
 DEFAULT_SIZE_RATIO_GROW = 1.3
+DEFAULT_CLUSTER_JACCARD = 0.45  # online content clustering threshold
 DEFAULT_OCR_LANGS = ("ch_tra", "en")
 
 LOG = logging.getLogger("slide_extractor")
@@ -78,6 +79,7 @@ class ExtractorConfig:
     hard_jaccard: float = DEFAULT_HARD_JACCARD
     size_ratio_drop: float = DEFAULT_SIZE_RATIO_DROP
     size_ratio_grow: float = DEFAULT_SIZE_RATIO_GROW
+    cluster_jaccard: float = DEFAULT_CLUSTER_JACCARD
     ocr_langs: tuple[str, ...] = DEFAULT_OCR_LANGS
     use_gpu: bool = True
 
@@ -310,12 +312,57 @@ def _pick_representative(seg: list[Sample]) -> Sample:
     return top[-1]
 
 
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _cluster_by_content(samples: list[Sample], cluster_thr: float) -> list[list[Sample]]:
+    """Online single-pass clustering by OCR content (Jaccard on bigram tokens).
+
+    Each frame either joins the best-matching existing cluster (jaccard ≥ thr)
+    or opens a new cluster. Each cluster represents one unique slide; the
+    cluster's "representative" is the max-tokens frame inside it, which we
+    keep updated as the cluster grows.
+
+    This guarantees structural completeness: any frame whose content does not
+    overlap enough with any prior slide *necessarily* becomes a new slide.
+    """
+    clusters: list[list[Sample]] = []
+    reps: list[Sample] = []  # parallel array of current best rep per cluster
+
+    for s in samples:
+        best_idx = -1
+        best_jac = 0.0
+        for i, rep in enumerate(reps):
+            j = _jaccard(rep.tokens, s.tokens)
+            if j > best_jac:
+                best_jac = j
+                best_idx = i
+        if best_idx >= 0 and best_jac >= cluster_thr:
+            clusters[best_idx].append(s)
+            # Update rep if this frame has more tokens (animation-complete state)
+            if len(s.tokens) > len(reps[best_idx].tokens):
+                reps[best_idx] = s
+        else:
+            clusters.append([s])
+            reps.append(s)
+    return clusters
+
+
 def extract_slides(
     video_path: Path,
     out_dir: Path,
     cfg: ExtractorConfig | None = None,
 ) -> list[Path]:
-    """Run the full extraction pipeline; returns list of saved PNG paths."""
+    """Run the full extraction pipeline; returns list of saved PNG paths.
+
+    Strategy: content-based clustering (no missing slides). Each unique OCR
+    content cluster becomes one output slide; within each cluster we pick the
+    frame with the most tokens (animation-complete state). Output is ordered
+    by the earliest occurrence of each cluster.
+    """
     cfg = cfg or ExtractorConfig()
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = out_dir.parent / f"_ocr_cache_{video_path.stem}.json"
@@ -325,29 +372,40 @@ def extract_slides(
         LOG.warning("no valid samples — nothing to do")
         return []
 
-    transitions = _find_transitions(samples, cfg, fps)
+    cluster_thr = cfg.cluster_jaccard
+    clusters = _cluster_by_content(samples, cluster_thr)
+    LOG.info("content-clustered: %d raw clusters (jaccard ≥ %.2f)", len(clusters), cluster_thr)
 
-    segments: list[tuple[int, int]] = []
-    prev = 0
-    for t in transitions:
-        segments.append((prev, t))
-        prev = t
-    segments.append((prev, len(samples)))
+    # Filter out tiny noise clusters: a real slide stays on screen for at
+    # least MIN_SLIDE_DURATION seconds, so a cluster of frames spanning less
+    # than that — especially singleton clusters — is almost certainly an
+    # OCR-flicker artefact at a transition boundary, not a real slide.
+    def cluster_span_sec(c: list[Sample]) -> float:
+        if len(c) < 2:
+            return 0.0
+        return (c[-1].frame_idx - c[0].frame_idx) / fps + cfg.sample_sec
 
-    segments = _filter_short_segments(segments, samples, cfg, fps)
-    LOG.info("after duration filter: %d slides", len(segments))
+    min_frames = max(2, int(cfg.min_duration_sec / cfg.sample_sec))
+    real = [c for c in clusters if len(c) >= min_frames]
+    dropped = len(clusters) - len(real)
+    if dropped:
+        LOG.info("dropped %d noise clusters (< %d frames each)", dropped, min_frames)
+    clusters = real
+
+    # Sort clusters by their earliest frame_idx so output is in time order
+    clusters.sort(key=lambda c: c[0].frame_idx)
 
     saved: list[Path] = []
-    for slide_no, (start, end) in enumerate(segments, start=1):
-        seg_samples = samples[start:end]
-        if not seg_samples:
-            continue
-        best = _pick_representative(seg_samples)
+    for slide_no, cluster in enumerate(clusters, start=1):
+        best = _pick_representative(cluster)
         ts = hms(best.frame_idx / fps).replace(":", "h", 1).replace(":", "m") + "s"
         path = out_dir / f"slide_{slide_no:03d}_{ts}.png"
         cv2.imwrite(str(path), best.frame)
         saved.append(path)
-        LOG.info("[+] slide %03d @ %s  (%d tokens)", slide_no, hms(best.frame_idx / fps), len(best.tokens))
+        LOG.info(
+            "[+] slide %03d @ %s  (%d tokens, cluster of %d frames)",
+            slide_no, hms(best.frame_idx / fps), len(best.tokens), len(cluster),
+        )
     return saved
 
 
@@ -378,6 +436,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-sec", type=float, default=DEFAULT_SAMPLE_SEC, help="Sampling interval in seconds")
     p.add_argument("--phash-thr", type=int, default=DEFAULT_PHASH_THR, help="pHash distance threshold for transitions")
     p.add_argument("--min-duration", type=float, default=DEFAULT_MIN_DURATION_SEC, help="Min slide duration (s)")
+    p.add_argument(
+        "--cluster-jaccard", type=float, default=DEFAULT_CLUSTER_JACCARD,
+        help="Jaccard threshold for content clustering (lower = more conservative = fewer merges)",
+    )
     p.add_argument("--cpu", action="store_true", help="Force CPU-only OCR (default: GPU if available)")
     p.add_argument(
         "--lang", action="append", default=None,
@@ -397,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
         sample_sec=args.sample_sec,
         phash_thr=args.phash_thr,
         min_duration_sec=args.min_duration,
+        cluster_jaccard=args.cluster_jaccard,
         use_gpu=not args.cpu,
         ocr_langs=tuple(args.lang) if args.lang else DEFAULT_OCR_LANGS,
     )
