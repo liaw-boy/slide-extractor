@@ -1,0 +1,8 @@
+opencv-python>=4.8
+easyocr>=1.7
+imagehash>=4.3
+Pillow>=10.0
+numpy>=1.24
+python-pptx>=0.6.21
+# Optional, for YouTube downloading:
+# yt-dlp>=2024.1

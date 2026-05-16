@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slide-extractor"
+version = "0.1.0"
+description = "Extract complete slides from lecture videos into PNG + PPTX, using pHash + GPU OCR."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["video", "slides", "ocr", "lecture", "pptx", "education"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "opencv-python>=4.8",
+    "easyocr>=1.7",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "python-pptx>=0.6.21",
+]
+
+[project.optional-dependencies]
+youtube = ["yt-dlp>=2024.1"]
+dev = ["black>=24.0", "ruff>=0.4", "pytest>=8.0", "pytest-cov>=5.0"]
+
+[project.scripts]
+slide-extractor = "slide_extractor:main"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # line length handled by black
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast, isolated unit tests",
+    "integration: tests that exercise the full pipeline with real video",
+]

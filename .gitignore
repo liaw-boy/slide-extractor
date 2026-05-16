@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project-specific: large media + caches MUST NOT be committed
+*.mp4
+*.webm
+*.mkv
+*.avi
+*.mov
+*.pptx
+_ocr_cache_*.json
+_video/
+slides_output/
+output/
+out/
+
+# Test fixtures (keep small samples only)
+tests/fixtures/large/
+
+# Local config
+.env
+.env.local
