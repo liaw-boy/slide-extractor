@@ -410,10 +410,30 @@ def extract_slides(
 
 
 def export_pptx(slide_paths: list[Path], out_path: Path) -> None:
-    """Export PNG slides into a 16:9 PPTX deck (one image per slide, full-bleed)."""
+    """Export PNGs into a PPTX deck preserving the source aspect ratio.
+
+    The page size is derived from the first slide image so 4:3 lecture
+    recordings come out 4:3 and 16:9 recordings come out 16:9, without any
+    distortion. Each image is full-bleed on its page.
+    """
+    if not slide_paths:
+        LOG.warning("no slides to export")
+        return
+    with Image.open(slide_paths[0]) as first:
+        src_w, src_h = first.size
+    # Fix the longer dimension at 10 inches so the page always fits typical
+    # editing canvases, then scale the other dimension by the source ratio.
+    if src_w >= src_h:
+        page_w_in = 10.0
+        page_h_in = 10.0 * (src_h / src_w)
+    else:
+        page_h_in = 10.0
+        page_w_in = 10.0 * (src_w / src_h)
+    LOG.info("PPTX page %.2f x %.2f in (source %dx%d)", page_w_in, page_h_in, src_w, src_h)
+
     prs = Presentation()
-    prs.slide_width = Inches(13.33)
-    prs.slide_height = Inches(7.5)
+    prs.slide_width = Inches(page_w_in)
+    prs.slide_height = Inches(page_h_in)
     blank_layout = prs.slide_layouts[6]
     for img in slide_paths:
         slide = prs.slides.add_slide(blank_layout)
