@@ -58,10 +58,6 @@ Open `http://localhost:8903/` in any browser on the same machine — Chrome, Fir
 
 The home page also shows a live **job dashboard** so you can submit multiple videos in parallel and jump between them.
 
-### Want to use it from your phone / another laptop?
-
-If the computer running `slide_web.py` is on the same Wi-Fi / LAN as your phone, just open the second URL the banner printed (`http://192.168.x.x:8903/`) on the phone. No extra setup. If you want secure access from outside your home network, install [Tailscale](https://tailscale.com/) on both devices — but it's strictly optional.
-
 ### Output layout
 
 ```
