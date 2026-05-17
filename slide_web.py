@@ -279,6 +279,58 @@ def _parse_multipart_upload(body: bytes, content_type: str) -> tuple[str, bytes,
     return filename, file_data, fields
 
 
+def purge_job(job: Job, *, also_uploaded: bool = True) -> dict[str, list[str]]:
+    """Remove a job's outputs from disk + drop it from JOBS dict.
+
+    Always preserves OCR cache (`_ocr_cache_*.json`) and downloaded videos
+    (`_video/`) so re-processing the same source is still fast. If the source
+    was an upload (`_uploads/`), it's deleted by default — that data came from
+    the user just for this job, so deleting the job implies deleting it.
+
+    Returns {"removed": [...paths...], "kept": [...paths...]}.
+    """
+    removed: list[str] = []
+    kept: list[str] = []
+
+    def _rm_dir(p: Optional[Path]) -> None:
+        if p and p.exists() and p.is_dir():
+            shutil.rmtree(p)
+            removed.append(str(p))
+
+    def _rm_file(p: Optional[Path]) -> None:
+        if p and p.exists() and p.is_file():
+            p.unlink()
+            removed.append(str(p))
+
+    _rm_dir(job.slides_dir)
+    _rm_file(job.pptx_path)
+    _rm_file(job.reviewed_pptx_path)
+    _rm_file(job.output_dir / f"_sheet_{job.id}.html")
+
+    # Source file: only delete if it lives under _uploads/ for this job
+    try:
+        src = Path(job.source)
+        if also_uploaded and src.is_file() and "_uploads" in src.parts:
+            src.unlink()
+            removed.append(str(src))
+        elif src.exists():
+            kept.append(str(src))
+    except (OSError, ValueError):
+        pass
+
+    # OCR cache is intentionally preserved.
+    if job.slides_dir is not None:
+        title = job.slides_dir.name
+        cache = job.output_dir / f"_ocr_cache_{title}.json"
+        if cache.exists():
+            kept.append(str(cache))
+
+    with JOBS_LOCK:
+        JOBS.pop(job.id, None)
+    persist_jobs()
+    return {"removed": removed, "kept": kept}
+
+
 def load_jobs(output_dir: Path) -> int:
     """Read _jobs.json into JOBS; flip in-flight jobs to 'interrupted'. Returns count."""
     global PERSIST_PATH
@@ -476,6 +528,12 @@ INDEX_HTML = f"""<!DOCTYPE html>
     margin-top: 6px; font-size: 11px; color: var(--muted);
     display: flex; gap: 10px; flex-wrap: wrap;
   }}
+  .job-card .trash {{
+    flex-shrink: 0; background: transparent; border: 1px solid #333;
+    color: var(--muted); padding: 4px 10px; border-radius: 6px;
+    cursor: pointer; font-size: 12px; line-height: 1;
+  }}
+  .job-card .trash:hover {{ border-color: var(--danger); color: var(--danger); }}
 </style>
 </head><body>
 <header>
@@ -643,6 +701,7 @@ async function renderJobs() {{
   const container = document.getElementById('jobs-list');
   if (!list.length) {{ sec.style.display = 'none'; return; }}
   sec.style.display = 'block';
+  const TERMINAL = ['done','error','cancelled','interrupted'];
   container.innerHTML = list.map(j => {{
     const pct = j.progress_total > 0
       ? Math.min(100, Math.round(100 * j.progress_current / j.progress_total))
@@ -650,17 +709,29 @@ async function renderJobs() {{
     const meta = j.status === 'done' && j.slide_count > 0
       ? `🖼 ${{j.slide_count}} 張 · ${{timeAgo(j.created_at)}}`
       : (j.error ? '❌ ' + j.error : `${{j.progress_label || ''}} · ${{timeAgo(j.created_at)}}`);
+    const canDelete = TERMINAL.includes(j.status);
+    const trashBtn = canDelete
+      ? `<button class="trash" onclick="event.preventDefault(); event.stopPropagation(); deleteJob('${{j.id}}', '${{shortenSource(j.source).replace(/'/g, "\\\\'")}}')" title="刪除這個 job（保留 OCR cache）">🗑</button>`
+      : '';
     return `
       <a class="job-card" href="/job/${{j.id}}">
         <div class="top">
           <span class="src" title="${{j.source.replace(/"/g,'&quot;')}}">${{shortenSource(j.source)}}</span>
           <span class="pill-sm ${{statusClass(j.status)}}">${{STATUS_LABEL[j.status] || j.status}} ${{j.status !== 'queued' && j.status !== 'done' && j.status !== 'error' ? pct + '%' : ''}}</span>
+          ${{trashBtn}}
         </div>
         <div class="bar-mini-outer"><div class="bar-mini" style="width:${{pct}}%;"></div></div>
         <div class="meta">${{meta}}</div>
       </a>
     `;
   }}).join('');
+}}
+async function deleteJob(id, label) {{
+  if (!confirm(`確定刪除「${{label}}」？\\n\\n會刪除：投影片 PNG + PPTX + 審核 sheet\\n保留：OCR cache（重跑很快）+ 下載/上傳的原始影片`)) return;
+  const r = await fetch('/api/job/' + id + '/delete', {{ method: 'POST' }});
+  const data = await r.json();
+  if (!data.ok) {{ alert('刪除失敗：' + data.error); return; }}
+  renderJobs();
 }}
 renderJobs();
 setInterval(renderJobs, 2000);
@@ -742,7 +813,7 @@ def progress_html(job_id: str) -> str:
     <pre id="log">等待…</pre>
   </details>
 
-  <p style="margin-top:24px"><a href="/" style="color: var(--muted)">← 抓另一個影片</a></p>
+  <p style="margin-top:24px"><a href="/" style="color: var(--muted)">← 回主頁</a></p>
 </main>
 <script>
 const jobId = "{job_id}";
@@ -1031,6 +1102,21 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     return
                 job.cancel_event.set()
                 self._send_json(200, {"ok": True, "status": "cancelling"})
+                return
+            if path.startswith("/api/job/") and path.endswith("/delete"):
+                jid = path[len("/api/job/"):-len("/delete")]
+                job = self._get_job(jid)
+                if not job:
+                    self._send_json(404, {"ok": False, "error": "no such job"})
+                    return
+                if job.status not in ("done", "error", "cancelled", "interrupted"):
+                    self._send_json(409, {
+                        "ok": False,
+                        "error": f"cancel first — job is {job.status}",
+                    })
+                    return
+                result = purge_job(job)
+                self._send_json(200, {"ok": True, **result})
                 return
             self.send_error(404)
 

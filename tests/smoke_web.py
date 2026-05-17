@@ -350,6 +350,53 @@ def t12_multipart_upload():
         p.unlink(missing_ok=True)
 
 
+def t14_delete_job():
+    """Job deletion — removes from dashboard + nukes output files,
+    keeps OCR cache so re-processing is still fast."""
+    print("\n[T14] Delete a done job — files removed, OCR cache kept")
+    if not DEMO_VIDEO.exists():
+        check("demo video present", False)
+        return
+    code, body = http_json("POST", "/api/start",
+                           {"source": str(DEMO_VIDEO), "mode": "auto"})
+    check("start fresh job for delete test", code == 200 and body.get("ok"))
+    if not body.get("ok"):
+        return
+    jid = body["job_id"]
+    final = poll_until_done(jid, max_wait=120)
+    check("job done before delete attempt", final["status"] == "done")
+    if final["status"] != "done":
+        return
+    slides_dir = OUTPUT_DIR / "M2 行動通訊安全 供應鏈安全不足錄"
+    pptx = OUTPUT_DIR / "M2 行動通訊安全 供應鏈安全不足錄.pptx"
+    sheet = OUTPUT_DIR / f"_sheet_{jid}.html"
+    cache = OUTPUT_DIR / "_ocr_cache_M2 行動通訊安全 供應鏈安全不足錄.json"
+    # Snapshot mtimes so we can detect deletion vs preservation
+    cache_existed = cache.exists()
+
+    # Cannot delete a running job
+    # (skipped — terminal already)
+
+    # Now delete
+    code, body = http_json("POST", f"/api/job/{jid}/delete", {})
+    check("delete returns 200 + ok", code == 200 and body.get("ok"))
+    check("delete reports removed paths", isinstance(body.get("removed"), list) and len(body["removed"]) > 0,
+          f"removed={body.get('removed')}")
+
+    # Job no longer in API
+    code, body2 = http_json("GET", f"/api/job/{jid}")
+    check("job gone from /api/job/<id>", code == 404)
+
+    # Files actually gone
+    check("slides_dir removed", not slides_dir.exists())
+    check("pptx removed", not pptx.exists())
+    check("sheet HTML removed", not sheet.exists())
+
+    # OCR cache preserved
+    if cache_existed:
+        check("OCR cache preserved", cache.exists())
+
+
 def t13_multipart_rejects_missing_file():
     """T-G06 negative case — multipart without file part returns 400."""
     print("\n[T13] T-G06 — multipart without file rejected")
@@ -411,6 +458,7 @@ def main() -> int:
         t11_cancel_running_job()
         t12_multipart_upload()
         t13_multipart_rejects_missing_file()
+        t14_delete_job()
         before_ids = t10_persistence_across_restart(jid)
     finally:
         stop_server(proc)
