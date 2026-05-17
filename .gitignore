@@ -45,3 +45,8 @@ tests/fixtures/large/
 # Local config
 .env
 .env.local
+
+# Local agent config + spec-kit machinery — keep out of public repo
+.claude/
+CLAUDE.md
+.specify/

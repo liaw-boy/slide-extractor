@@ -23,8 +23,10 @@ import argparse
 import http.server
 import json
 import logging
+import re
 import shutil
 import socketserver
+import subprocess
 import threading
 import time
 import uuid
@@ -37,7 +39,7 @@ from slide_extractor import (  # noqa: E402
     LOG,
     ExtractorConfig,
     extract_slides,
-    resolve_source,
+    is_url,
 )
 from slide_review import build_contact_sheet, export_filtered_pptx  # noqa: E402
 
@@ -59,23 +61,209 @@ class Job:
     slide_count: int = 0
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
+    # Live progress (-1 = indeterminate / no bar shown)
+    progress_current: int = 0
+    progress_total: int = 0
+    progress_label: str = ""
+
+
+# ────────────────────────── progress wiring ──────────────────────────
+RE_TOTAL_FRAMES = re.compile(r"frames=(\d+) sample-interval=(\d+)")
+RE_SAMPLED = re.compile(r"sampled (\d+) valid frames")
+RE_SAMPLING_DONE = re.compile(r"sampling done: (\d+) valid frames")
+RE_SLIDE_OUT = re.compile(r"\[\+\] slide (\d+) @")
+RE_YTDLP_PCT = re.compile(r"\[download\]\s+([\d.]+)%")
+
+
+class JobProgressHandler(logging.Handler):
+    """Translate slide_extractor LOG records into per-job progress fields."""
+
+    def __init__(self, job: Job):
+        super().__init__(level=logging.INFO)
+        self.job = job
+        self._total_samples = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return
+        if m := RE_TOTAL_FRAMES.search(msg):
+            frames = int(m.group(1))
+            interval = int(m.group(2))
+            self._total_samples = max(1, frames // interval)
+            self.job.progress_total = self._total_samples
+            self.job.progress_current = 0
+            self.job.progress_label = "OCR 採樣"
+            return
+        if "initializing EasyOCR" in msg:
+            self.job.progress_label = "啟動 OCR (GPU)"
+            return
+        if m := RE_SAMPLED.search(msg):
+            self.job.progress_current = int(m.group(1))
+            self.job.progress_label = "OCR 採樣"
+            return
+        if m := RE_SAMPLING_DONE.search(msg):
+            self.job.progress_current = int(m.group(1))
+            self.job.progress_label = "聚類分析中"
+            return
+        if "content-clustered" in msg or "dropped" in msg:
+            self.job.progress_label = "聚類分析中"
+            return
+        if RE_SLIDE_OUT.search(msg):
+            self.job.progress_label = "寫入 slide PNG"
+            return
+        if msg.startswith("PPTX"):
+            self.job.progress_label = "生成 PPTX"
+            return
+
+
+def stream_download_video(url: str, out_dir: Path, job: Job, height_cap: int = 1080) -> Path:
+    """yt-dlp download with live percentage piped into the job's progress fields."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (
+        f"bestvideo[height<={height_cap}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height_cap}]+bestaudio/best"
+    )
+    job.progress_label = "下載影片"
+    job.progress_total = 100
+    job.progress_current = 0
+
+    proc = subprocess.Popen(
+        [
+            "yt-dlp", "-f", fmt, "--merge-output-format", "mp4",
+            "-o", str(out_dir / "%(title).80s.%(ext)s"),
+            "--print", "after_move:filepath",
+            "--newline",
+            url,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    filepath: Optional[str] = None
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        if not line:
+            continue
+        if m := RE_YTDLP_PCT.search(line):
+            job.progress_current = int(float(m.group(1)))
+        elif line.startswith("/"):
+            filepath = line
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp failed (exit {proc.returncode})")
+    if not filepath:
+        raise RuntimeError("yt-dlp did not print filepath")
+    return Path(filepath)
+
+
+def resolve_with_progress(src: str, download_dir: Path, job: Job) -> Path:
+    """Like slide_extractor.resolve_source, but pipes yt-dlp % into the job."""
+    if is_url(src):
+        return stream_download_video(src, download_dir, job)
+    local = Path(src).expanduser()
+    if not local.exists():
+        raise FileNotFoundError(
+            f"input not found: {src!r}\n"
+            "  Pass either an existing local video file or a URL starting with http(s)://"
+        )
+    if not local.is_file():
+        raise FileNotFoundError(f"input is not a file: {local}")
+    return local
 
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
+PERSIST_PATH: Optional[Path] = None  # set by main(); enables T-G05 persistence
 
 
 def _log(job: Job, msg: str) -> None:
     job.log.append(msg)
     LOG.info("[job %s] %s", job.id[:8], msg)
+    persist_jobs()
+
+
+def _job_to_dict(j: Job) -> dict:
+    return {
+        "id": j.id, "source": j.source, "mode": j.mode,
+        "output_dir": str(j.output_dir), "status": j.status,
+        "log": list(j.log),
+        "slides_dir": str(j.slides_dir) if j.slides_dir else None,
+        "pptx_path": str(j.pptx_path) if j.pptx_path else None,
+        "reviewed_pptx_path": str(j.reviewed_pptx_path) if j.reviewed_pptx_path else None,
+        "slide_count": j.slide_count, "error": j.error,
+        "created_at": j.created_at,
+        "progress_current": j.progress_current,
+        "progress_total": j.progress_total,
+        "progress_label": j.progress_label,
+    }
+
+
+def _job_from_dict(d: dict) -> Job:
+    return Job(
+        id=d["id"], source=d["source"], mode=d["mode"],
+        output_dir=Path(d["output_dir"]), status=d["status"],
+        log=list(d.get("log") or []),
+        slides_dir=Path(d["slides_dir"]) if d.get("slides_dir") else None,
+        pptx_path=Path(d["pptx_path"]) if d.get("pptx_path") else None,
+        reviewed_pptx_path=Path(d["reviewed_pptx_path"]) if d.get("reviewed_pptx_path") else None,
+        slide_count=d.get("slide_count", 0),
+        error=d.get("error"),
+        created_at=d.get("created_at", time.time()),
+        progress_current=d.get("progress_current", 0),
+        progress_total=d.get("progress_total", 0),
+        progress_label=d.get("progress_label", ""),
+    )
+
+
+def persist_jobs() -> None:
+    """Atomic write of JOBS to disk; no-op if PERSIST_PATH not configured."""
+    if PERSIST_PATH is None:
+        return
+    try:
+        with JOBS_LOCK:
+            data = [_job_to_dict(j) for j in JOBS.values()]
+        tmp = PERSIST_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.replace(PERSIST_PATH)
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("persist_jobs failed: %s", e)
+
+
+def load_jobs(output_dir: Path) -> int:
+    """Read _jobs.json into JOBS; flip in-flight jobs to 'interrupted'. Returns count."""
+    global PERSIST_PATH
+    PERSIST_PATH = output_dir / "_jobs.json"
+    if not PERSIST_PATH.exists():
+        return 0
+    try:
+        records = json.loads(PERSIST_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        LOG.warning("could not load %s: %s", PERSIST_PATH, e)
+        return 0
+    n = 0
+    with JOBS_LOCK:
+        for d in records:
+            job = _job_from_dict(d)
+            if job.status in ("queued", "resolving", "extracting"):
+                job.status = "interrupted"
+                job.error = "server restart — re-submit to retry"
+            JOBS[job.id] = job
+            n += 1
+    return n
 
 
 def run_job(job: Job) -> None:
     """Worker: download (if URL) → extract → contact sheet → auto PPTX."""
+    handler = JobProgressHandler(job)
+    LOG.addHandler(handler)
     try:
         job.status = "resolving"
         _log(job, f"resolving: {job.source}")
-        video_path = resolve_source(job.source, job.output_dir / "_video")
+        video_path = resolve_with_progress(job.source, job.output_dir / "_video", job)
         _log(job, f"video file: {video_path}")
 
         title = video_path.stem
@@ -93,6 +281,10 @@ def run_job(job: Job) -> None:
         )
 
         job.status = "extracting"
+        # Reset progress for the new phase; handler will populate from log lines
+        job.progress_total = 0
+        job.progress_current = 0
+        job.progress_label = "準備擷取"
         _log(job, f"extracting (mode={job.mode}, sample={cfg.sample_sec}s)")
         paths = extract_slides(video_path, job.slides_dir, cfg)
         job.slide_count = len(paths)
@@ -108,11 +300,15 @@ def run_job(job: Job) -> None:
             build_contact_sheet(job.slides_dir, sheet_path)
             _log(job, "contact sheet ready")
 
+        job.progress_label = "完成"
+        job.progress_current = job.progress_total or 1
         job.status = "done"
     except Exception as e:  # noqa: BLE001
         job.status = "error"
         job.error = str(e)
         _log(job, f"ERROR: {e}")
+    finally:
+        LOG.removeHandler(handler)
 
 
 # ────────────────────────── HTML ──────────────────────────
@@ -196,6 +392,36 @@ INDEX_HTML = f"""<!DOCTYPE html>
     padding: 24px; text-align: center; color: var(--muted);
     font-size: 11px; border-top: 1px solid #2a2a30; margin-top: 40px;
   }}
+  .job-card {{
+    background: var(--card); border: 1px solid #2a2a30; border-radius: 10px;
+    padding: 14px 16px; text-decoration: none; color: inherit;
+    display: block; transition: border-color .15s ease;
+  }}
+  .job-card:hover {{ border-color: var(--accent); }}
+  .job-card .top {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
+  .job-card .src {{
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-size: 13px; color: #cbd5e1;
+  }}
+  .job-card .pill-sm {{
+    flex-shrink: 0; padding: 3px 9px; border-radius: 999px;
+    background: #0a0a0e; font-size: 11px; color: var(--muted);
+  }}
+  .job-card .pill-sm.done {{ background: var(--accent); color: #000; }}
+  .job-card .pill-sm.error {{ background: var(--danger); color: #000; }}
+  .job-card .pill-sm.running {{ background: #2563eb; color: #fff; }}
+  .job-card .bar-mini-outer {{
+    margin-top: 8px; background: #0a0a0e; border-radius: 999px;
+    height: 4px; overflow: hidden;
+  }}
+  .job-card .bar-mini {{
+    background: var(--accent); height: 100%; width: 0%;
+    transition: width 300ms ease; border-radius: 999px;
+  }}
+  .job-card .meta {{
+    margin-top: 6px; font-size: 11px; color: var(--muted);
+    display: flex; gap: 10px; flex-wrap: wrap;
+  }}
 </style>
 </head><body>
 <header>
@@ -241,6 +467,12 @@ INDEX_HTML = f"""<!DOCTYPE html>
       <span style="color: var(--muted)">本工具完全在本機運作，不上傳任何影片或截圖到外部伺服器。</span>
     </div>
   </div>
+
+  <section id="jobs-section" style="margin-top: 32px; display: none;">
+    <h2 style="font-size: 16px; margin: 0 0 12px;">📋 你的工作列表</h2>
+    <p class="hint" style="margin-top:-4px;">最近抓過的影片；點任何一張卡片回到該 job 的進度頁。本頁自動更新。</p>
+    <div id="jobs-list" style="display: flex; flex-direction: column; gap: 10px; margin-top: 12px;"></div>
+  </section>
 </main>
 <footer>
   Slide Extractor · 個人學習工具 · 請尊重原作者著作權
@@ -264,8 +496,76 @@ async function submitForm(e) {{
   }}
   location.href = '/job/' + data.job_id;
 }}
+
+const STATUS_LABEL = {{
+  queued: "排隊中", resolving: "下載中",
+  extracting: "分析中", done: "完成", error: "失敗",
+  interrupted: "中斷"
+}};
+function timeAgo(ts) {{
+  const sec = Math.floor(Date.now()/1000 - ts);
+  if (sec < 60) return sec + ' 秒前';
+  if (sec < 3600) return Math.floor(sec/60) + ' 分鐘前';
+  if (sec < 86400) return Math.floor(sec/3600) + ' 小時前';
+  return Math.floor(sec/86400) + ' 天前';
+}}
+function shortenSource(s) {{
+  if (s.startsWith('http')) {{
+    try {{ const u = new URL(s); return u.hostname + u.pathname + u.search; }}
+    catch (e) {{ return s; }}
+  }}
+  // local path → last segment
+  const parts = s.split('/');
+  return parts[parts.length - 1] || s;
+}}
+function statusClass(status) {{
+  if (status === 'done') return 'done';
+  if (status === 'error' || status === 'interrupted') return 'error';
+  if (status === 'queued') return '';
+  return 'running';
+}}
+async function renderJobs() {{
+  let r;
+  try {{ r = await fetch('/api/jobs'); }} catch (e) {{ return; }}
+  const data = await r.json();
+  const list = data.jobs || [];
+  const sec = document.getElementById('jobs-section');
+  const container = document.getElementById('jobs-list');
+  if (!list.length) {{ sec.style.display = 'none'; return; }}
+  sec.style.display = 'block';
+  container.innerHTML = list.map(j => {{
+    const pct = j.progress_total > 0
+      ? Math.min(100, Math.round(100 * j.progress_current / j.progress_total))
+      : (j.status === 'done' ? 100 : 0);
+    const meta = j.status === 'done' && j.slide_count > 0
+      ? `🖼 ${{j.slide_count}} 張 · ${{timeAgo(j.created_at)}}`
+      : (j.error ? '❌ ' + j.error : `${{j.progress_label || ''}} · ${{timeAgo(j.created_at)}}`);
+    return `
+      <a class="job-card" href="/job/${{j.id}}">
+        <div class="top">
+          <span class="src" title="${{j.source.replace(/"/g,'&quot;')}}">${{shortenSource(j.source)}}</span>
+          <span class="pill-sm ${{statusClass(j.status)}}">${{STATUS_LABEL[j.status] || j.status}} ${{j.status !== 'queued' && j.status !== 'done' && j.status !== 'error' ? pct + '%' : ''}}</span>
+        </div>
+        <div class="bar-mini-outer"><div class="bar-mini" style="width:${{pct}}%;"></div></div>
+        <div class="meta">${{meta}}</div>
+      </a>
+    `;
+  }}).join('');
+}}
+renderJobs();
+setInterval(renderJobs, 2000);
 </script>
 </body></html>"""
+
+
+STATUS_LABEL = {
+    "queued": "排隊中",
+    "resolving": "下載影片中",
+    "extracting": "分析投影片中",
+    "done": "完成",
+    "error": "失敗",
+    "interrupted": "中斷（server 重啟）",
+}
 
 
 def progress_html(job_id: str) -> str:
@@ -273,15 +573,61 @@ def progress_html(job_id: str) -> str:
 <html lang="zh-Hant"><head>
 <meta charset="utf-8">
 <title>Job {job_id[:8]} — Slide Extractor</title>
-<style>{THEME_CSS}</style>
+<style>{THEME_CSS}
+  .stage {{
+    background: var(--card); border-radius: 10px; padding: 18px 20px;
+    margin-bottom: 16px;
+  }}
+  .stage-row {{ display: flex; align-items: center; gap: 12px; }}
+  .stage h2 {{ margin: 0; font-size: 16px; font-weight: 600; flex: 1; }}
+  .stage .eta {{ font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }}
+  .bar-outer {{
+    margin-top: 12px; background: #0a0a0e; border-radius: 999px;
+    height: 10px; overflow: hidden; position: relative;
+  }}
+  .bar-inner {{
+    background: linear-gradient(90deg, #22c55e, #4ade80);
+    height: 100%; width: 0%; transition: width 400ms ease;
+    border-radius: 999px;
+  }}
+  .bar-indeterminate {{
+    background: linear-gradient(90deg, transparent 0%, #4ade80 50%, transparent 100%);
+    background-size: 50% 100%; animation: stripe 1.4s linear infinite;
+    width: 100%;
+  }}
+  @keyframes stripe {{ from {{ background-position: -50% 0; }} to {{ background-position: 150% 0; }} }}
+  .stage-label {{ margin-top: 8px; font-size: 13px; color: #cbd5e1; }}
+  .stage-label .pct {{ color: var(--accent); font-weight: 600; }}
+  details.tech {{ margin-top: 10px; font-size: 12px; color: var(--muted); }}
+  details.tech summary {{ cursor: pointer; }}
+  details.tech pre {{
+    margin-top: 8px; background: #000; padding: 12px; border-radius: 6px;
+    font-size: 11px; max-height: 240px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; color: #6b7280;
+  }}
+</style>
 </head><body>
 <header>
-  <h1>進度 <span id="pill" class="status-pill">queued</span></h1>
-  <p class="hint">Job <code>{job_id[:8]}</code> · 自動更新；完成後會出現操作按鈕。</p>
+  <h1>進度 <span id="pill" class="status-pill">排隊中</span></h1>
+  <p class="hint">Job <code>{job_id[:8]}</code> · 頁面自動更新，沒有東西要按。完成後會出現「下載 PPTX」「看候選」按鈕。</p>
 </header>
 <main>
-  <pre class="log" id="log">等待…</pre>
-  <div id="actions" style="margin-top:18px; display:flex; gap:12px; flex-wrap:wrap;"></div>
+  <div class="stage">
+    <div class="stage-row">
+      <h2 id="phase">準備中…</h2>
+      <span class="eta" id="eta">—</span>
+    </div>
+    <div class="bar-outer"><div class="bar-inner" id="bar"></div></div>
+    <div class="stage-label"><span id="phase_detail">啟動中</span> <span class="pct" id="pct"></span></div>
+  </div>
+
+  <div id="actions" style="display:flex; gap:12px; flex-wrap:wrap;"></div>
+
+  <details class="tech">
+    <summary>顯示技術細節 / log（給工程師看的）</summary>
+    <pre id="log">等待…</pre>
+  </details>
+
   <p style="margin-top:24px"><a href="/" style="color: var(--muted)">← 抓另一個影片</a></p>
 </main>
 <script>
@@ -289,28 +635,76 @@ const jobId = "{job_id}";
 const pill = document.getElementById('pill');
 const logEl = document.getElementById('log');
 const actions = document.getElementById('actions');
+const bar = document.getElementById('bar');
+const phase = document.getElementById('phase');
+const phaseDetail = document.getElementById('phase_detail');
+const pct = document.getElementById('pct');
+const etaEl = document.getElementById('eta');
+const STATUS = {{
+  queued: "排隊中", resolving: "下載影片中",
+  extracting: "分析投影片中", done: "完成", error: "失敗"
+}};
+const PHASE = {{
+  queued: "排隊", resolving: "下載影片",
+  extracting: "分析投影片", done: "全部完成 ✓", error: "失敗 ✗"
+}};
+let lastPct = -1, lastTime = Date.now();
 
 async function poll() {{
-  const r = await fetch('/api/job/' + jobId);
+  let r;
+  try {{ r = await fetch('/api/job/' + jobId); }}
+  catch (e) {{ setTimeout(poll, 2000); return; }}
   const j = await r.json();
-  pill.textContent = j.status;
+  pill.textContent = STATUS[j.status] || j.status;
   pill.className = 'status-pill ' + (j.status === 'done' ? 'done' : j.status === 'error' ? 'error' : '');
+  phase.textContent = PHASE[j.status] || j.status;
+  phaseDetail.textContent = j.progress_label || '處理中';
   logEl.textContent = j.log.join('\\n');
   logEl.scrollTop = logEl.scrollHeight;
+
+  if (j.progress_total > 0) {{
+    const p = Math.min(100, Math.round(100 * j.progress_current / j.progress_total));
+    bar.style.width = p + '%';
+    bar.className = 'bar-inner';
+    pct.textContent = `· ${{j.progress_current}}/${{j.progress_total}} (${{p}}%)`;
+    // crude ETA: extrapolate from rate since last poll
+    const now = Date.now();
+    if (lastPct >= 0 && p > lastPct) {{
+      const ratePerMs = (p - lastPct) / (now - lastTime);
+      if (ratePerMs > 0) {{
+        const remainMs = (100 - p) / ratePerMs;
+        const remainSec = Math.round(remainMs / 1000);
+        etaEl.textContent = remainSec > 60
+          ? `預估剩 ${{Math.round(remainSec/60)}} 分鐘`
+          : `預估剩 ${{remainSec}} 秒`;
+      }}
+    }}
+    lastPct = p; lastTime = now;
+  }} else {{
+    // indeterminate phase
+    bar.className = 'bar-inner bar-indeterminate';
+    bar.style.width = '100%';
+    pct.textContent = '';
+    etaEl.textContent = '';
+  }}
+
   if (j.status === 'done') {{
+    bar.style.width = '100%';
+    bar.className = 'bar-inner';
+    etaEl.textContent = '';
     renderActions(j);
     return;
   }}
-  if (j.status === 'error') return;
+  if (j.status === 'error') {{ etaEl.textContent = ''; return; }}
   setTimeout(poll, 1500);
 }}
 function renderActions(j) {{
   const parts = [];
   if (j.slide_count > 0) {{
-    parts.push(`<a class="button-link" href="/job/${{jobId}}/sheet"><button>看 ${{j.slide_count}} 張候選 / 勾選後生成 PPTX</button></a>`);
-    parts.push(`<a class="button-link" href="/job/${{jobId}}/pptx" download><button class="ghost">下載 Auto PPTX</button></a>`);
+    parts.push(`<a class="button-link" href="/job/${{jobId}}/sheet"><button>👀 看 ${{j.slide_count}} 張候選 / 勾選後產 PPTX</button></a>`);
+    parts.push(`<a class="button-link" href="/job/${{jobId}}/pptx" download><button class="ghost">⬇ 直接下載 Auto PPTX</button></a>`);
   }} else {{
-    parts.push(`<span style="color: var(--muted)">沒抓到 slide — 試試 review 模式或檢查影片來源</span>`);
+    parts.push(`<span style="color: var(--muted)">沒抓到 slide — 試試 Review 模式，或確認影片是「投影片型」的講演</span>`);
   }}
   actions.innerHTML = parts.join('');
 }}
@@ -398,6 +792,26 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     return
                 self.send_error(404)
                 return
+            if path == "/api/jobs":
+                with JOBS_LOCK:
+                    summaries = [
+                        {
+                            "id": j.id,
+                            "source": j.source,
+                            "mode": j.mode,
+                            "status": j.status,
+                            "slide_count": j.slide_count,
+                            "progress_current": j.progress_current,
+                            "progress_total": j.progress_total,
+                            "progress_label": j.progress_label,
+                            "created_at": j.created_at,
+                            "error": j.error,
+                        }
+                        for j in JOBS.values()
+                    ]
+                summaries.sort(key=lambda x: x["created_at"], reverse=True)
+                self._send_json(200, {"ok": True, "jobs": summaries})
+                return
             if path.startswith("/api/job/"):
                 jid = path[len("/api/job/"):]
                 job = self._get_job(jid)
@@ -409,6 +823,9 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     "slide_count": job.slide_count, "error": job.error,
                     "has_pptx": bool(job.pptx_path and job.pptx_path.exists()),
                     "has_reviewed": bool(job.reviewed_pptx_path and job.reviewed_pptx_path.exists()),
+                    "progress_current": job.progress_current,
+                    "progress_total": job.progress_total,
+                    "progress_label": job.progress_label,
                 })
                 return
             self.send_error(404)
@@ -430,6 +847,7 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     job = Job(id=uuid.uuid4().hex, source=source, mode=mode, output_dir=output_dir)
                     with JOBS_LOCK:
                         JOBS[job.id] = job
+                    persist_jobs()
                     t = threading.Thread(target=run_job, args=(job,), daemon=True)
                     t.start()
                     self._send_json(200, {"ok": True, "job_id": job.id})
@@ -486,6 +904,29 @@ def _rewrite_sheet(html: bytes, job_id: str) -> bytes:
     html_str = html_str.replace(
         'src="slides/', f'src="/job/{job_id}/slides/'
     )
+    # Inject a sticky top navbar with back links + style tweak so it doesn't
+    # overlap the existing sticky header in the sheet template.
+    nav = f"""<nav style="
+        position: sticky; top: 0; z-index: 20;
+        background: #0a0a0e; border-bottom: 1px solid #2a2a30;
+        padding: 10px 24px; display: flex; gap: 16px; align-items: center;
+        font-size: 13px;
+    ">
+      <a href="/job/{job_id}" style="
+        color: #4ade80; text-decoration: none;
+        padding: 5px 10px; border: 1px solid #4ade80; border-radius: 6px;
+      ">← 回到此 job 進度頁</a>
+      <a href="/" style="color: #888; text-decoration: none;">← 回到首頁 / 工作列表</a>
+      <span style="margin-left: auto; color: #555; font-size: 11px;">
+        Job <code style="color: #888;">{job_id[:8]}</code>
+      </span>
+    </nav>"""
+    # Make the sheet's own sticky header not stick to top:0 so our nav sits above it.
+    html_str = html_str.replace(
+        "header {\n    position: sticky; top: 0;",
+        "header {\n    position: sticky; top: 44px;",
+    )
+    html_str = html_str.replace("<body>", "<body>" + nav, 1)
     return html_str.encode("utf-8")
 
 
@@ -531,6 +972,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    restored = load_jobs(args.output)
+    if restored:
+        LOG.info("restored %d jobs from %s", restored, PERSIST_PATH)
 
     handler = make_handler_v2(args.output)
     with ReusableTCPServer((args.bind, args.port), handler) as srv:
