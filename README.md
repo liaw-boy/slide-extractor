@@ -5,6 +5,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Personal Use Only](https://img.shields.io/badge/use-personal%20study%20only-orange.svg)](#-copyright--著作權)
+
+> [!IMPORTANT]
+> **Personal-study tool only. You must own legitimate access to the source video and comply with the original copyright and the source platform's Terms of Service.** See [Copyright / 著作權](#-copyright--著作權) and [NOTICE](NOTICE).
+>
+> **僅供個人學習用途。使用者必須擁有影片的合法存取權，並遵守原內容著作權與平台服務條款。**
 
 ---
 
@@ -43,6 +49,34 @@ Output:
 ├── <video-title>.pptx                    # auto mode output
 └── <video-title>_REVIEWED.pptx           # review-mode output
 ```
+
+---
+
+## ✅ Scope / 適用範圍
+
+**Designed for** screen recordings of typed slide decks — lecture videos, conference talks, tutorial walk-throughs, online courses. Default OCR languages are Traditional Chinese + English.
+
+| Verdict | Cases |
+|---------|-------|
+| ✅ **Works well** | PowerPoint / Keynote / Google Slides screen recordings · slide-driven lectures · conference talks with screen capture · 中文/English content |
+| 🟡 **Borderline (use review mode)** | Slides with small speaker-camera overlay · slides containing embedded short video clips · code-heavy slides with sparse text (lower `--min-text-len`) · non-CJK/English languages (use `--lang`) |
+| ❌ **Not designed for** | Whiteboard / handwriting videos (no OCR signal) · software demo screencasts (no slide structure) · pure talking-head with no slides · Prezi-style smooth-zoom transitions · videos shorter than ~30 s |
+
+If your video is in the "❌" column, the right tool is `ffmpeg` keyframe extraction or manual screenshotting — not this.
+
+---
+
+## ⚠ Copyright / 著作權
+<a name="-copyright--著作權"></a>
+
+This tool is intended **strictly for personal study and research**. By using it you confirm that you have legitimate access to the source video and that your downstream use complies with the original content's copyright terms and the hosting platform's Terms of Service.
+
+**Do not use this tool to:**
+- Reproduce or redistribute copyrighted content you do not own or license
+- Build commercial / for-profit derivative products
+- Circumvent platform restrictions in violation of their ToS
+
+The tool runs **entirely on your local machine** and uploads nothing to external servers. Responsibility for downstream use of the extracted slides rests with the user.
 
 ---
 
@@ -102,6 +136,21 @@ Inherits all of the above plus:
 | `--port` | `8901` | HTTP port for the review UI |
 | `--bind` | `0.0.0.0` | Bind address (use `127.0.0.1` for local-only) |
 | `--skip-extract` | off | Skip re-extraction (when iterating on review of an already-extracted dir) |
+
+### `slide_web.py` — single-server web GUI (all-in-one)
+
+The browser-only entry point: open one page, paste a URL or local path, pick a mode, watch progress, then prune candidates on the same dark contact sheet.
+
+```bash
+python3 slide_web.py            # listens on 0.0.0.0:8903
+# → open http://localhost:8903/  (or Tailscale http://<your-ip>:8903/)
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output` | `~/slides_output` | Output base directory |
+| `--port` | `8903` | HTTP port |
+| `--bind` | `0.0.0.0` | Bind address |
 
 ---
 

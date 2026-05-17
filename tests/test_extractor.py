@@ -119,3 +119,27 @@ class TestClassifyTransition:
         is_trans, reason = sx.classify_transition(a, b, cfg)
         assert is_trans is True
         assert "content change" in reason
+
+
+@pytest.mark.unit
+class TestResolveSource:
+    def test_http_url_detected(self) -> None:
+        assert sx.is_url("https://www.youtube.com/watch?v=abc") is True
+        assert sx.is_url("http://example.com/video.mp4") is True
+        assert sx.is_url("www.youtube.com/watch?v=abc") is True
+
+    def test_local_paths_not_detected(self) -> None:
+        assert sx.is_url("/tmp/lecture.mp4") is False
+        assert sx.is_url("lecture.mp4") is False
+        assert sx.is_url("./videos/foo.mkv") is False
+
+    def test_existing_local_file_passes(self, tmp_path: Path) -> None:
+        video = tmp_path / "fake.mp4"
+        video.write_bytes(b"\x00")
+        out = sx.resolve_source(str(video), tmp_path / "_dl")
+        assert out == video
+
+    def test_missing_local_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError) as exc:
+            sx.resolve_source("not_a_real_file.mp4", tmp_path / "_dl")
+        assert "not found" in str(exc.value)

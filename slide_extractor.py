@@ -125,6 +125,35 @@ def hms(seconds: float) -> str:
 
 
 # ────────────────────────── video I/O ──────────────────────────
+URL_SCHEMES = ("http://", "https://", "www.")
+
+
+def is_url(src: str) -> bool:
+    """Return True if `src` looks like a remote URL rather than a local path."""
+    return src.lower().startswith(URL_SCHEMES)
+
+
+def resolve_source(src: str, download_dir: Path) -> Path:
+    """Return a local video file path, downloading via yt-dlp if `src` is a URL.
+
+    Raises FileNotFoundError with a clear message when a non-URL string does
+    not correspond to an existing file (catches typos before they hit yt-dlp).
+    """
+    if is_url(src):
+        LOG.info("downloading: %s", src)
+        return download_video(src, download_dir)
+    local = Path(src).expanduser()
+    if not local.exists():
+        raise FileNotFoundError(
+            f"input not found: {src!r}\n"
+            "  Pass either an existing local video file or a URL "
+            "starting with http(s)://"
+        )
+    if not local.is_file():
+        raise FileNotFoundError(f"input is not a file: {local}")
+    return local
+
+
 def download_video(url: str, out_dir: Path, height_cap: int = 1080) -> Path:
     """Download a YouTube video at the best available quality up to `height_cap`."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -446,7 +475,17 @@ def export_pptx(slide_paths: list[Path], out_path: Path) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="slide-extractor",
-        description="Extract complete slides from lecture videos into PNG + PPTX.",
+        description=(
+            "Extract complete slides from typed-slide lecture videos into PNG + PPTX.\n"
+            "\n"
+            "Scope: designed for screen recordings of PowerPoint/Keynote/Google\n"
+            "Slides lectures, conference talks, and tutorials. Not for whiteboard\n"
+            "videos, software demo screencasts, or talking-head footage.\n"
+            "\n"
+            "Copyright: for personal study only. Respect the original content's\n"
+            "copyright and the source platform's Terms of Service."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("source", help="Local video file path OR YouTube URL")
     p.add_argument(
@@ -486,12 +525,7 @@ def main(argv: list[str] | None = None) -> int:
 
     src = args.source
     out_base: Path = args.output
-    local = Path(src)
-    if local.exists() and local.is_file():
-        video_path = local
-    else:
-        LOG.info("downloading: %s", src)
-        video_path = download_video(src, out_base / "_video")
+    video_path = resolve_source(src, out_base / "_video")
 
     title = video_path.stem
     slides_dir = out_base / title

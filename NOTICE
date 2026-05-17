@@ -1,0 +1,37 @@
+slide-extractor — NOTICE
+========================
+
+This software is provided as a **personal-study and research utility**.
+
+By using slide-extractor you acknowledge and agree that:
+
+1. You have legitimate access to the source video you process.
+2. Your downstream use of any extracted slides complies with:
+     - the original content's copyright terms,
+     - the licensing of any embedded third-party material, and
+     - the Terms of Service of the platform hosting the source video.
+
+You MUST NOT use slide-extractor to:
+
+  • Reproduce or redistribute copyrighted content you do not own
+    or are not licensed to share.
+  • Build commercial / for-profit derivative products from
+    copyrighted source material.
+  • Circumvent platform restrictions in a way that violates the
+    platform's Terms of Service.
+
+Operational notes:
+
+  • slide-extractor runs entirely on the user's local machine.
+  • No video frames, OCR text, or PPTX output is transmitted to
+    any external server by this software.
+  • The yt-dlp dependency, used optionally for downloading public
+    videos, is governed by its own license and the source platform's
+    ToS. Responsibility for compliance rests with the user.
+
+The MIT License (see LICENSE) governs the software itself but does
+NOT grant any rights to copyrighted content the user chooses to
+process with it.
+
+Responsibility for downstream use of extracted content rests
+solely with the user.
