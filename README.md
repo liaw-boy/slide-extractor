@@ -14,25 +14,53 @@
 
 ---
 
-## ⚡ Quick start
+## ⚡ Quick start (everything runs on your own computer)
+
+### Prerequisites
+
+- Python **3.10 or newer** (`python3 --version` to check)
+- ~5 GB free disk for the EasyOCR model + processed videos
+- *Optional* but **20× faster**: an NVIDIA GPU with CUDA drivers. CPU works too — it just takes longer.
+
+### Install + start
 
 ```bash
 git clone https://github.com/liaw-boy/slide-extractor.git
 cd slide-extractor
-./install.sh
-python3 slide_web.py
+./install.sh                  # one-shot installer (~5 min first time)
+python3 slide_web.py          # starts the web server, prints the URL to open
 ```
 
-Then open **`http://localhost:8903/`** in your browser (or `http://<your-host>:8903/` over Tailscale / LAN).
+When the server starts you'll see something like:
 
-That's the whole flow:
+```
+══════════════════════════════════════════════════════
+  Slide Extractor — Web GUI
+══════════════════════════════════════════════════════
+
+  ▸ Open this URL in your browser on THIS computer:
+      http://localhost:8903/
+
+  ▸ From another device on the same network:
+      http://192.168.1.42:8903/         ← auto-detected LAN IP
+
+  Press Ctrl+C in this terminal to stop the server.
+```
+
+Open `http://localhost:8903/` in any browser on the same machine — Chrome, Firefox, Safari, Edge. **No Tailscale, no port forwarding, no account needed.** Everything stays on your computer.
+
+### The 4-step flow
 
 1. Paste a **YouTube URL** or a **local video path** into the form.
-2. Pick **Auto** (fastest) or **Review** (over-extracts so you can prune visually).
+2. Pick **Auto** (fastest, ~95% accurate) or **Review** (over-extracts so you can prune visually).
 3. Watch the live progress bar + ETA.
-4. Click **下載 PPTX** when it finishes, or **看候選** to prune in the contact sheet.
+4. Click **下載 PPTX** when it finishes, or **看候選** to prune in the contact sheet first.
 
 The home page also shows a live **job dashboard** so you can submit multiple videos in parallel and jump between them.
+
+### Want to use it from your phone / another laptop?
+
+If the computer running `slide_web.py` is on the same Wi-Fi / LAN as your phone, just open the second URL the banner printed (`http://192.168.x.x:8903/`) on the phone. No extra setup. If you want secure access from outside your home network, install [Tailscale](https://tailscale.com/) on both devices — but it's strictly optional.
 
 ### Output layout
 
@@ -55,21 +83,11 @@ The home page also shows a live **job dashboard** so you can submit multiple vid
 python3 slide_web.py
 ```
 
-You'll see:
-```
-▶ Slide Extractor Web GUI: http://<your-host>:8903/
-  Local:     http://localhost:8903/
-  Ctrl+C 結束。
-```
-
-Keep this terminal running. Stop with `Ctrl+C` when done. The server is local-only by default but binds to `0.0.0.0`, so anyone on your LAN / Tailscale who can reach the host IP can use it. To restrict to your own machine: `python3 slide_web.py --bind 127.0.0.1`.
+The banner prints the URL(s) to open. Keep this terminal running; press `Ctrl+C` to stop. By default the server listens on all interfaces so other devices on your LAN can reach it; restrict to just your machine with `--bind 127.0.0.1`.
 
 ### Step 2 — Open the page
 
-Open one of:
-- **Same machine**: `http://localhost:8903/`
-- **Another device on LAN**: `http://<host-IP>:8903/`
-- **Tailscale**: `http://<tailscale-IP>:8903/`
+Open `http://localhost:8903/` on the same machine. (If you want to use a phone or another laptop on the same network, the banner also prints a LAN IP URL.)
 
 You'll see the submission form, the **Scope** card, the **Copyright** notice, and (after you've run anything) a **📋 你的工作列表 (Job dashboard)** that lists every recent job with its status + a mini progress bar.
 

@@ -57,19 +57,35 @@ except Exception as e:
     print(f'model download failed: {e}', file=sys.stderr); sys.exit(1)
 "
 
-cat <<EOF
+cat <<'EOF'
 
 ✓ Installation complete.
 
-Quick start:
+──────────────────────────────────────────────────────────
+  RECOMMENDED — Web GUI (works on any computer, no Tailscale needed)
+──────────────────────────────────────────────────────────
+
+  $ python3 slide_web.py
+
+Then open this URL on the same computer:
+  http://localhost:8903/
+
+Paste a YouTube URL or a local video path, click 開始抓 slide,
+watch the progress bar, click 下載 PPTX when done.
+
+The server prints all access URLs when it starts (including
+your LAN IP if other devices on your network need to use it).
+Press Ctrl+C in that terminal to stop the server.
+
+──────────────────────────────────────────────────────────
+  Advanced — command-line interface
+──────────────────────────────────────────────────────────
+
   $ python3 slide_extractor.py /path/to/lecture.mp4         # auto mode
-  $ python3 slide_review.py    /path/to/lecture.mp4         # review-with-UI mode
+  $ python3 slide_extractor.py "https://www.youtube.com/watch?v=..."   # YouTube
+  $ python3 slide_review.py /path/to/lecture.mp4            # CLI + browser review
 
-  $ python3 slide_extractor.py "https://www.youtube.com/watch?v=..."  # YouTube
+  $ python3 slide_extractor.py --help                       # full reference
 
-After review-UI mode, open the printed URL in a browser, tick the slides to
-keep, click "Save selection → generate PPTX". Final PPTX lands in:
-  ~/slides_output/<video-title>_REVIEWED.pptx
-
-Run "python3 slide_extractor.py --help" for full CLI reference.
+Output PPTX lands in: ~/slides_output/<video-title>.pptx
 EOF

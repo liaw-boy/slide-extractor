@@ -224,10 +224,15 @@ def classify_transition(
 
 
 # ────────────────────────── extraction pipeline ──────────────────────────
+class CancelledError(Exception):
+    """Raised when the caller's should_cancel callback returns True mid-pipeline."""
+
+
 def _sample_frames(
     video_path: Path,
     cache_path: Path,
     cfg: ExtractorConfig,
+    should_cancel=None,  # Optional[Callable[[], bool]]
 ) -> tuple[list[Sample], float]:
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -283,6 +288,11 @@ def _sample_frames(
         if len(samples) and len(samples) % 50 == 0:
             elapsed = time.time() - t0
             LOG.info("sampled %d valid frames (%.0fs elapsed)", len(samples), elapsed)
+            if should_cancel is not None and should_cancel():
+                cap.release()
+                if cache_dirty:
+                    cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                raise CancelledError("sampling cancelled by caller")
         frame_idx += 1
 
     cap.release()
@@ -384,6 +394,7 @@ def extract_slides(
     video_path: Path,
     out_dir: Path,
     cfg: ExtractorConfig | None = None,
+    should_cancel=None,  # Optional[Callable[[], bool]] — checked between sampling batches
 ) -> list[Path]:
     """Run the full extraction pipeline; returns list of saved PNG paths.
 
@@ -391,18 +402,26 @@ def extract_slides(
     content cluster becomes one output slide; within each cluster we pick the
     frame with the most tokens (animation-complete state). Output is ordered
     by the earliest occurrence of each cluster.
+
+    If ``should_cancel`` is provided, it's called periodically during
+    sampling; returning True raises ``CancelledError`` so the caller can
+    finalize gracefully.
     """
     cfg = cfg or ExtractorConfig()
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = out_dir.parent / f"_ocr_cache_{video_path.stem}.json"
 
-    samples, fps = _sample_frames(video_path, cache_path, cfg)
+    samples, fps = _sample_frames(video_path, cache_path, cfg, should_cancel=should_cancel)
+    if should_cancel is not None and should_cancel():
+        raise CancelledError("cancelled before clustering")
     if not samples:
         LOG.warning("no valid samples — nothing to do")
         return []
 
     cluster_thr = cfg.cluster_jaccard
     clusters = _cluster_by_content(samples, cluster_thr)
+    if should_cancel is not None and should_cancel():
+        raise CancelledError("cancelled after clustering")
     LOG.info("content-clustered: %d raw clusters (jaccard ≥ %.2f)", len(clusters), cluster_thr)
 
     # Filter out tiny noise clusters: a real slide stays on screen for at
@@ -426,6 +445,8 @@ def extract_slides(
 
     saved: list[Path] = []
     for slide_no, cluster in enumerate(clusters, start=1):
+        if should_cancel is not None and should_cancel():
+            raise CancelledError(f"cancelled after writing {slide_no - 1} slides")
         best = _pick_representative(cluster)
         ts = hms(best.frame_idx / fps).replace(":", "h", 1).replace(":", "m") + "s"
         path = out_dir / f"slide_{slide_no:03d}_{ts}.png"

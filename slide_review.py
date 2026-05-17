@@ -58,6 +58,7 @@ def build_contact_sheet(slides_dir: Path, html_path: Path) -> None:
     html = f"""<!DOCTYPE html>
 <html lang="zh-Hant"><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Slide Review — {slides_dir.name}</title>
 <style>
   :root {{
@@ -78,23 +79,55 @@ def build_contact_sheet(slides_dir: Path, html_path: Path) -> None:
   .toolbar {{ margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }}
   button {{
     background: var(--card); color: var(--text); border: 1px solid #333;
-    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    padding: 10px 16px; border-radius: 6px; cursor: pointer; font-size: 14px;
+    min-height: 44px;  /* iOS recommended tap target */
   }}
   button.primary {{ background: var(--accent); color: #000; border-color: var(--accent); }}
+  @media (max-width: 480px) {{
+    .toolbar {{ gap: 6px; }}
+    .toolbar button {{ flex: 1 1 auto; padding: 12px 10px; font-size: 14px; }}
+    .toolbar .status {{ flex: 1 0 100%; text-align: center; margin-top: 6px; }}
+  }}
   .grid {{
     margin-top: 20px;
     display: grid; gap: 16px;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   }}
+  /* Single column on phones; two on small tablets */
+  @media (max-width: 480px) {{
+    .grid {{ grid-template-columns: 1fr; gap: 12px; }}
+    body {{ padding: 0 12px 100px; }}
+  }}
+  @media (min-width: 481px) and (max-width: 768px) {{
+    .grid {{ grid-template-columns: repeat(2, 1fr); }}
+  }}
   .card {{
     position: relative; background: var(--card); border-radius: 10px;
     overflow: hidden; cursor: pointer; transition: transform .15s ease;
     border: 2px solid transparent;
+    -webkit-tap-highlight-color: transparent;
   }}
   .card:has(input:checked) {{ border-color: var(--accent); }}
   .card:has(input:not(:checked)) {{ opacity: .35; }}
-  .card img {{ width: 100%; display: block; }}
-  .card input {{ position: absolute; top: 8px; right: 8px; transform: scale(1.5); }}
+  .card img {{ width: 100%; display: block; pointer-events: none; }}
+  /* Big tap target — the whole card toggles via the checkbox covering it */
+  .card input {{
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    margin: 0; opacity: 0; cursor: pointer;
+  }}
+  /* Visible checkmark indicator (since the actual input is invisible) */
+  .card::after {{
+    content: "✓"; position: absolute; top: 10px; right: 10px;
+    width: 28px; height: 28px; border-radius: 50%;
+    background: rgba(0,0,0,.6); color: transparent;
+    border: 2px solid rgba(255,255,255,.4);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 16px; pointer-events: none;
+    transition: background .15s, color .15s, border-color .15s;
+  }}
+  .card:has(input:checked)::after {{
+    background: var(--accent); color: #000; border-color: var(--accent);
+  }}
   .num {{
     position: absolute; top: 8px; left: 8px;
     background: rgba(0,0,0,.7); padding: 4px 8px; border-radius: 4px;

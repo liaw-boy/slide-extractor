@@ -37,6 +37,7 @@ from urllib.parse import quote, unquote
 
 from slide_extractor import (  # noqa: E402
     LOG,
+    CancelledError,
     ExtractorConfig,
     extract_slides,
     is_url,
@@ -65,6 +66,8 @@ class Job:
     progress_current: int = 0
     progress_total: int = 0
     progress_label: str = ""
+    # T-G04 — cancellation. Not persisted (each server start gets fresh events).
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 # ────────────────────────── progress wiring ──────────────────────────
@@ -203,6 +206,7 @@ def _job_to_dict(j: Job) -> dict:
 
 
 def _job_from_dict(d: dict) -> Job:
+    # cancel_event is NOT persisted — each server start hands out fresh events.
     return Job(
         id=d["id"], source=d["source"], mode=d["mode"],
         output_dir=Path(d["output_dir"]), status=d["status"],
@@ -231,6 +235,48 @@ def persist_jobs() -> None:
         tmp.replace(PERSIST_PATH)
     except Exception as e:  # noqa: BLE001
         LOG.warning("persist_jobs failed: %s", e)
+
+
+def _parse_multipart_upload(body: bytes, content_type: str) -> tuple[str, bytes, dict[str, str]]:
+    """Extract first file (filename, data) and any form fields from multipart body.
+
+    Returns (filename, file_bytes, form_fields_dict). Minimal parser tuned for
+    one file + a handful of text fields — no streaming, no nested parts.
+    """
+    m = re.search(r'boundary="?([^";]+)"?', content_type)
+    if not m:
+        raise ValueError("no boundary in Content-Type")
+    boundary = b"--" + m.group(1).encode()
+    fields: dict[str, str] = {}
+    filename: Optional[str] = None
+    file_data: bytes = b""
+    for part in body.split(boundary):
+        if not part or part in (b"--", b"--\r\n"):
+            continue
+        header_end = part.find(b"\r\n\r\n")
+        if header_end < 0:
+            continue
+        headers_blob = part[:header_end].lstrip(b"\r\n").decode("utf-8", "replace")
+        data = part[header_end + 4:]
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        # parse Content-Disposition: form-data; name="…"; filename="…"
+        name_match = re.search(r'name="([^"]+)"', headers_blob)
+        if not name_match:
+            continue
+        field_name = name_match.group(1)
+        file_match = re.search(r'filename="([^"]*)"', headers_blob)
+        if file_match and file_match.group(1):
+            filename = file_match.group(1)
+            file_data = data
+        else:
+            try:
+                fields[field_name] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+    if not filename:
+        raise ValueError("no file part in upload")
+    return filename, file_data, fields
 
 
 def load_jobs(output_dir: Path) -> int:
@@ -286,7 +332,10 @@ def run_job(job: Job) -> None:
         job.progress_current = 0
         job.progress_label = "準備擷取"
         _log(job, f"extracting (mode={job.mode}, sample={cfg.sample_sec}s)")
-        paths = extract_slides(video_path, job.slides_dir, cfg)
+        paths = extract_slides(
+            video_path, job.slides_dir, cfg,
+            should_cancel=job.cancel_event.is_set,
+        )
         job.slide_count = len(paths)
         _log(job, f"extracted {len(paths)} candidates")
 
@@ -303,6 +352,11 @@ def run_job(job: Job) -> None:
         job.progress_label = "完成"
         job.progress_current = job.progress_total or 1
         job.status = "done"
+        persist_jobs()  # final snapshot — _log won't fire after this point
+    except CancelledError:
+        job.status = "cancelled"
+        job.progress_label = "已取消"
+        _log(job, "cancelled by user")
     except Exception as e:  # noqa: BLE001
         job.status = "error"
         job.error = str(e)
@@ -431,20 +485,32 @@ INDEX_HTML = f"""<!DOCTYPE html>
 <main>
   <form id="start" onsubmit="return submitForm(event)">
     <label class="field">
-      <span>Source（YouTube URL 或本機影片絕對路徑）</span>
-      <input type="text" id="source" required
+      <span>Source — 貼 YouTube URL 或本機檔案絕對路徑</span>
+      <input type="text" id="source"
         placeholder="https://www.youtube.com/watch?v=…   或   /home/you/lecture.mp4" />
     </label>
+
+    <div id="drop-zone" style="
+      border: 2px dashed #333; border-radius: 10px;
+      padding: 24px; text-align: center; cursor: pointer;
+      background: rgba(255,255,255,0.02); color: var(--muted);
+      transition: border-color .15s, background .15s; font-size: 13px;
+    ">
+      <strong style="display:block;color:var(--text);margin-bottom:4px;">或 — 把影片檔拖到這裡</strong>
+      <span>（也可以點這裡選檔，影片只會傳到本機 server，不會上雲）</span>
+      <input type="file" id="file-input" accept="video/*" style="display:none" />
+    </div>
+
     <div class="modes">
       <label>
         <input type="radio" name="mode" value="auto" checked />
         <strong>Auto</strong>
-        <small>最快，95%+ 準確，會直接生成 PPTX</small>
+        <small>最快，演算法直接出 PPTX（約 95% 準確）</small>
       </label>
       <label>
         <input type="radio" name="mode" value="review" />
         <strong>Review</strong>
-        <small>過收所有候選，你勾完再生成 PPTX，100% 不漏頁</small>
+        <small>過收所有候選，你目視勾完再生成 PPTX</small>
       </label>
     </div>
     <button type="submit" id="go">開始抓 slide</button>
@@ -482,6 +548,10 @@ async function submitForm(e) {{
   e.preventDefault();
   const source = document.getElementById('source').value.trim();
   const mode = document.querySelector('input[name=mode]:checked').value;
+  if (!source) {{
+    alert('請貼 URL/路徑，或把檔案拖到下面的方框（或點方框選檔）');
+    return;
+  }}
   const btn = document.getElementById('go');
   btn.disabled = true; btn.textContent = '建立 job…';
   const r = await fetch('/api/start', {{
@@ -497,10 +567,50 @@ async function submitForm(e) {{
   location.href = '/job/' + data.job_id;
 }}
 
+async function uploadFile(file) {{
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const dz = document.getElementById('drop-zone');
+  const sizeMB = (file.size / 1024 / 1024).toFixed(1);
+  dz.innerHTML = `<strong style="color:var(--text)">上傳中…</strong><br><span>${{file.name}} (${{sizeMB}} MB)</span>`;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('mode', mode);
+  const r = await fetch('/api/start', {{ method: 'POST', body: fd }});
+  const data = await r.json();
+  if (!data.ok) {{
+    alert('上傳失敗：' + data.error);
+    location.reload();
+    return;
+  }}
+  location.href = '/job/' + data.job_id;
+}}
+
+(function setupDropZone() {{
+  const dz = document.getElementById('drop-zone');
+  const fi = document.getElementById('file-input');
+  dz.addEventListener('click', () => fi.click());
+  fi.addEventListener('change', () => {{
+    if (fi.files.length > 0) uploadFile(fi.files[0]);
+  }});
+  ['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => {{
+    e.preventDefault(); e.stopPropagation();
+    dz.style.borderColor = 'var(--accent)';
+    dz.style.background = 'rgba(74,222,128,0.08)';
+  }}));
+  ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => {{
+    e.preventDefault(); e.stopPropagation();
+    dz.style.borderColor = '#333';
+    dz.style.background = 'rgba(255,255,255,0.02)';
+  }}));
+  dz.addEventListener('drop', e => {{
+    if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
+  }});
+}})();
+
 const STATUS_LABEL = {{
   queued: "排隊中", resolving: "下載中",
   extracting: "分析中", done: "完成", error: "失敗",
-  interrupted: "中斷"
+  interrupted: "中斷", cancelled: "已取消"
 }};
 function timeAgo(ts) {{
   const sec = Math.floor(Date.now()/1000 - ts);
@@ -520,7 +630,7 @@ function shortenSource(s) {{
 }}
 function statusClass(status) {{
   if (status === 'done') return 'done';
-  if (status === 'error' || status === 'interrupted') return 'error';
+  if (status === 'error' || status === 'interrupted' || status === 'cancelled') return 'error';
   if (status === 'queued') return '';
   return 'running';
 }}
@@ -565,6 +675,7 @@ STATUS_LABEL = {
     "done": "完成",
     "error": "失敗",
     "interrupted": "中斷（server 重啟）",
+    "cancelled": "已取消",
 }
 
 
@@ -622,6 +733,9 @@ def progress_html(job_id: str) -> str:
   </div>
 
   <div id="actions" style="display:flex; gap:12px; flex-wrap:wrap;"></div>
+  <div id="cancel-row" style="margin-top:12px;">
+    <button id="cancel-btn" class="ghost" onclick="cancelJob()" style="display:none;">取消這個 job</button>
+  </div>
 
   <details class="tech">
     <summary>顯示技術細節 / log（給工程師看的）</summary>
@@ -688,6 +802,12 @@ async function poll() {{
     etaEl.textContent = '';
   }}
 
+  // Cancel button visibility — only while truly in-flight
+  const cancelBtn = document.getElementById('cancel-btn');
+  cancelBtn.style.display =
+    (j.status === 'queued' || j.status === 'resolving' || j.status === 'extracting')
+    ? 'inline-block' : 'none';
+
   if (j.status === 'done') {{
     bar.style.width = '100%';
     bar.className = 'bar-inner';
@@ -695,8 +815,18 @@ async function poll() {{
     renderActions(j);
     return;
   }}
-  if (j.status === 'error') {{ etaEl.textContent = ''; return; }}
+  if (j.status === 'error' || j.status === 'cancelled' || j.status === 'interrupted') {{
+    etaEl.textContent = '';
+    return;
+  }}
   setTimeout(poll, 1500);
+}}
+async function cancelJob() {{
+  if (!confirm('確定要取消這個 job？已經 OCR 的內容會保留在 cache。')) return;
+  const btn = document.getElementById('cancel-btn');
+  btn.disabled = true; btn.textContent = '取消中…';
+  await fetch('/api/job/' + jobId + '/cancel', {{ method: 'POST' }});
+  // poll will update UI; button hides itself when status flips
 }}
 function renderActions(j) {{
   const parts = [];
@@ -835,9 +965,28 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
             path = unquote(self.path.split("?", 1)[0])
             if path == "/api/start":
                 try:
-                    body = json.loads(self._read_body() or b"{}")
-                    source = (body.get("source") or "").strip()
-                    mode = body.get("mode", "auto")
+                    content_type = self.headers.get("Content-Type", "")
+                    body = self._read_body()
+                    if content_type.startswith("multipart/form-data"):
+                        try:
+                            filename, file_bytes, form = _parse_multipart_upload(
+                                body, content_type
+                            )
+                        except ValueError as e:
+                            self._send_json(400, {"ok": False, "error": str(e)})
+                            return
+                        uploads_dir = output_dir / "_uploads"
+                        uploads_dir.mkdir(parents=True, exist_ok=True)
+                        # Sanitize filename — keep extension, prefix with uuid to avoid clash
+                        safe_name = Path(filename).name or "upload.mp4"
+                        upload_path = uploads_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+                        upload_path.write_bytes(file_bytes)
+                        source = str(upload_path)
+                        mode = form.get("mode", "auto")
+                    else:
+                        data = json.loads(body or b"{}")
+                        source = (data.get("source") or "").strip()
+                        mode = data.get("mode", "auto")
                     if not source:
                         self._send_json(400, {"ok": False, "error": "source required"})
                         return
@@ -870,6 +1019,34 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     })
                 except Exception as e:  # noqa: BLE001
                     self._send_json(500, {"ok": False, "error": str(e)})
+                return
+            if path.startswith("/api/job/") and path.endswith("/cancel"):
+                jid = path[len("/api/job/"):-len("/cancel")]
+                job = self._get_job(jid)
+                if not job:
+                    self._send_json(404, {"ok": False, "error": "no such job"})
+                    return
+                if job.status in ("done", "error", "cancelled", "interrupted"):
+                    self._send_json(409, {"ok": False, "error": f"job already {job.status}"})
+                    return
+                job.cancel_event.set()
+                self._send_json(200, {"ok": True, "status": "cancelling"})
+                return
+            self.send_error(404)
+
+        def do_DELETE(self):  # noqa: N802 — alias for /cancel
+            path = unquote(self.path.split("?", 1)[0])
+            if path.startswith("/api/job/"):
+                jid = path[len("/api/job/"):]
+                job = self._get_job(jid)
+                if not job:
+                    self._send_json(404, {"ok": False, "error": "no such job"})
+                    return
+                if job.status in ("done", "error", "cancelled", "interrupted"):
+                    self._send_json(409, {"ok": False, "error": f"job already {job.status}"})
+                    return
+                job.cancel_event.set()
+                self._send_json(200, {"ok": True, "status": "cancelling"})
                 return
             self.send_error(404)
 
@@ -978,13 +1155,56 @@ def main(argv: list[str] | None = None) -> int:
 
     handler = make_handler_v2(args.output)
     with ReusableTCPServer((args.bind, args.port), handler) as srv:
-        host = "<your-host>" if args.bind == "0.0.0.0" else args.bind
-        print(f"\n▶ Slide Extractor Web GUI: http://{host}:{args.port}/")
-        print(f"  Tailscale: http://100.94.113.75:{args.port}/")
-        print(f"  Local:     http://localhost:{args.port}/")
-        print("  Ctrl+C 結束。\n")
+        _print_startup_banner(args.bind, args.port)
         srv.serve_forever()
     return 0
+
+
+def _detect_lan_ips() -> list[str]:
+    """Best-effort: return non-loopback IPv4 addresses we're bound to."""
+    import socket as _s
+    ips: list[str] = []
+    try:
+        hostname = _s.gethostname()
+        for info in _s.getaddrinfo(hostname, None, _s.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    # Fallback: ask the kernel which address it would use for outbound traffic.
+    try:
+        sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and ip not in ips:
+            ips.append(ip)
+        sock.close()
+    except OSError:
+        pass
+    return ips
+
+
+def _print_startup_banner(bind: str, port: int) -> None:
+    """Tell users exactly where to point their browser."""
+    print("\n" + "═" * 56)
+    print("  Slide Extractor — Web GUI")
+    print("═" * 56)
+    print(f"\n  ▸ Open this URL in your browser on THIS computer:")
+    print(f"      http://localhost:{port}/")
+    if bind in ("0.0.0.0", "::"):
+        lan_ips = _detect_lan_ips()
+        if lan_ips:
+            print(f"\n  ▸ From another device on the same network:")
+            for ip in lan_ips:
+                print(f"      http://{ip}:{port}/")
+        print(f"\n  (Listening on all interfaces. To restrict to this")
+        print(f"   computer only: re-run with --bind 127.0.0.1)")
+    else:
+        print(f"\n  (Listening on {bind} only)")
+    print(f"\n  Press Ctrl+C in this terminal to stop the server.")
+    print("═" * 56 + "\n")
 
 
 if __name__ == "__main__":
