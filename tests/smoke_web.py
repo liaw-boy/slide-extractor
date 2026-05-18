@@ -262,44 +262,56 @@ def t9_404_for_missing_job():
 
 
 def t11_cancel_running_job():
-    """T-G04 — cancel mid-flight."""
+    """T-G04 — cancel mid-flight.
+
+    To guarantee the job is genuinely in-flight long enough to cancel, this
+    test deletes the OCR cache for the demo video first so sampling has to
+    do real GPU work (slow path), then sends cancel ~2 seconds in.
+    """
     print("\n[T11] T-G04 — cancel a running job")
     if not DEMO_VIDEO.exists():
         check("demo video present", False)
         return
-    # Start a job. We'll cancel it before it finishes.
-    code, body = http_json("POST", "/api/start",
-                           {"source": str(DEMO_VIDEO), "mode": "review"})  # review = slower
-    check("start job for cancel test", code == 200 and body.get("ok"))
-    if not body.get("ok"):
-        return
-    jid = body["job_id"]
-    # Give it a moment to actually start extracting (so it has work to cancel)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        _, s = http_json("GET", f"/api/job/{jid}")
-        if s.get("status") == "extracting" and (s.get("progress_total") or 0) > 0:
-            break
-        if s.get("status") in ("done", "error"):
-            break
-        time.sleep(0.5)
-    # Send cancel
-    code, body = http_json("POST", f"/api/job/{jid}/cancel", {})
-    check("cancel POST returns 200", code == 200 and body.get("ok"))
-    # Wait for status to flip to cancelled
-    deadline = time.time() + 20
-    final = {}
-    while time.time() < deadline:
-        _, final = http_json("GET", f"/api/job/{jid}")
-        if final.get("status") in ("cancelled", "done", "error"):
-            break
-        time.sleep(0.5)
-    check("job reaches cancelled status",
-          final.get("status") == "cancelled",
-          f"status={final.get('status')}")
-    # Second cancel → 409 (already terminal)
-    code, body = http_json("POST", f"/api/job/{jid}/cancel", {})
-    check("second cancel returns 409 conflict", code == 409)
+    # Force slow path so we have time to cancel.
+    cache = OUTPUT_DIR / f"_ocr_cache_{DEMO_VIDEO.stem}.json"
+    cache_backup = None
+    if cache.exists():
+        cache_backup = cache.read_bytes()
+        cache.unlink()
+    try:
+        code, body = http_json("POST", "/api/start",
+                               {"source": str(DEMO_VIDEO), "mode": "review"})
+        check("start job for cancel test", code == 200 and body.get("ok"))
+        if not body.get("ok"):
+            return
+        jid = body["job_id"]
+        # Wait until sampling has clearly started (progress_total set, current >= 50).
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            _, s = http_json("GET", f"/api/job/{jid}")
+            if s.get("status") == "extracting" and s.get("progress_current", 0) >= 50:
+                break
+            if s.get("status") in ("done", "error"):
+                break
+            time.sleep(0.5)
+        code, body = http_json("POST", f"/api/job/{jid}/cancel", {})
+        check("cancel POST returns 200", code == 200 and body.get("ok"))
+        deadline = time.time() + 30
+        final = {}
+        while time.time() < deadline:
+            _, final = http_json("GET", f"/api/job/{jid}")
+            if final.get("status") in ("cancelled", "done", "error"):
+                break
+            time.sleep(0.5)
+        check("job reaches cancelled status",
+              final.get("status") == "cancelled",
+              f"status={final.get('status')}")
+        code, body = http_json("POST", f"/api/job/{jid}/cancel", {})
+        check("second cancel returns 409 conflict", code == 409)
+    finally:
+        # Restore the OCR cache so subsequent tests (T2 in the next run) run fast.
+        if cache_backup is not None:
+            cache.write_bytes(cache_backup)
 
 
 def t12_multipart_upload():
@@ -389,6 +401,23 @@ def t16_storage_delete_path_safety():
     # empty paths list
     code, body = http_json("POST", "/api/storage/delete", {"paths": []})
     check("empty paths list returns 400", code == 400)
+
+
+def t18_shutdown_endpoint():
+    """POST /api/shutdown stops the server cleanly. Test is run LAST in main()
+    because it kills the server we're testing against."""
+    print("\n[T18] Shutdown endpoint")
+    code, body = http_json("POST", "/api/shutdown", {})
+    check("shutdown returns 200 + ok", code == 200 and body.get("ok"))
+    check("shutdown reports message", "message" in body)
+    # Server should stop accepting connections within ~1 second
+    time.sleep(1.5)
+    refused = False
+    try:
+        urllib.request.urlopen(BASE + "/", timeout=1)
+    except (urllib.error.URLError, ConnectionError, OSError):
+        refused = True
+    check("server actually shut down (port refusing)", refused)
 
 
 def t17_storage_delete_real_file():
@@ -539,8 +568,14 @@ def main() -> int:
                 restored.get("status") == "done",
                 f"got {restored.get('status')!r}",
             )
+        # T18 must run last — it kills the server.
+        t18_shutdown_endpoint()
     finally:
-        stop_server(proc2)
+        # If shutdown worked, proc2 is already dead; stop_server is a no-op.
+        try:
+            stop_server(proc2)
+        except Exception:
+            pass
 
     # Summary
     passed = sum(1 for ok, _ in results if ok)

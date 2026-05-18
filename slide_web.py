@@ -181,6 +181,7 @@ def resolve_with_progress(src: str, download_dir: Path, job: Job) -> Path:
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
 PERSIST_PATH: Optional[Path] = None  # set by main(); enables T-G05 persistence
+_SERVER: Optional[socketserver.TCPServer] = None  # set by main(); enables /api/shutdown
 
 
 def _log(job: Job, msg: str) -> None:
@@ -728,6 +729,14 @@ INDEX_HTML = f"""<!DOCTYPE html>
     padding: 24px; text-align: center; color: var(--muted);
     font-size: 11px; border-top: 1px solid #2a2a30; margin-top: 40px;
   }}
+  .shutdown-btn {{
+    background: transparent; border: 1px solid #2a2a30;
+    color: var(--muted); padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; font-size: 12px;
+  }}
+  .shutdown-btn:hover {{
+    border-color: var(--danger); color: var(--danger);
+  }}
   .job-card {{
     background: var(--card); border: 1px solid #2a2a30; border-radius: 10px;
     padding: 14px 16px; text-decoration: none; color: inherit;
@@ -923,6 +932,9 @@ INDEX_HTML = f"""<!DOCTYPE html>
 </main>
 <footer>
   Slide Extractor · 個人學習工具 · 請尊重原作者著作權
+  <div style="margin-top:10px;">
+    <button class="shutdown-btn" onclick="shutdownServer()">🔌 停止 server</button>
+  </div>
 </footer>
 <script>
 async function submitForm(e) {{
@@ -1177,6 +1189,28 @@ renderStorage();
 setInterval(renderStorage, 10000);
 renderJobs();
 setInterval(renderJobs, 2000);
+
+async function shutdownServer() {{
+  if (!confirm('停止 server 並結束程式？\\n\\n所有正在跑的 job 會被取消（已完成的不受影響）。\\n要再用工具就要回 terminal 重新跑 python3 slide_web.py。')) return;
+  try {{
+    const r = await fetch('/api/shutdown', {{ method: 'POST' }});
+    const data = await r.json();
+    document.body.innerHTML =
+      '<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;color:#cbd5e1;font-family:-apple-system,sans-serif;">' +
+      '<div style="font-size:48px;margin-bottom:16px;">🛑</div>' +
+      '<h1 style="font-size:18px;margin:0 0 8px;">Server 已停止</h1>' +
+      '<p style="color:#888;font-size:13px;">' + (data.cancelled_jobs ? '取消了 ' + data.cancelled_jobs + ' 個進行中的 job · ' : '') +
+      '回 terminal 重新跑 <code style="background:#1c1c22;padding:2px 6px;border-radius:3px;">python3 slide_web.py</code> 才能再用。</p>' +
+      '</div>';
+    document.body.style.background = '#0f0f12';
+  }} catch (e) {{
+    // Connection refused = server already down (expected)
+    document.body.innerHTML =
+      '<div style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;color:#cbd5e1;font-family:-apple-system,sans-serif;background:#0f0f12;">' +
+      '<div style="font-size:48px;margin-bottom:16px;">🛑</div>' +
+      '<h1 style="font-size:18px;margin:0;">Server 已停止</h1></div>';
+  }}
+}}
 </script>
 </body></html>"""
 
@@ -1480,6 +1514,25 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
         # ── POST ──
         def do_POST(self):  # noqa: N802
             path = unquote(self.path.split("?", 1)[0])
+            if path == "/api/shutdown":
+                # Signal cancel to all in-flight jobs so they wind down cleanly.
+                with JOBS_LOCK:
+                    inflight = [j for j in JOBS.values()
+                                if j.status in ("queued", "resolving", "extracting")]
+                for j in inflight:
+                    j.cancel_event.set()
+                self._send_json(200, {
+                    "ok": True,
+                    "cancelled_jobs": len(inflight),
+                    "message": "server shutting down",
+                })
+                # Stop the server from a separate thread so this response can finish.
+                def _stop() -> None:
+                    time.sleep(0.2)
+                    if _SERVER is not None:
+                        _SERVER.shutdown()
+                threading.Thread(target=_stop, daemon=True).start()
+                return
             if path == "/api/start":
                 try:
                     content_type = self.headers.get("Content-Type", "")
@@ -1712,9 +1765,13 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("restored %d jobs from %s", restored, PERSIST_PATH)
 
     handler = make_handler_v2(args.output)
+    global _SERVER
     with ReusableTCPServer((args.bind, args.port), handler) as srv:
+        _SERVER = srv
         _print_startup_banner(args.bind, args.port)
         srv.serve_forever()
+    _SERVER = None
+    LOG.info("server stopped")
     return 0
 
 
