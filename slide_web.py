@@ -279,6 +279,224 @@ def _parse_multipart_upload(body: bytes, content_type: str) -> tuple[str, bytes,
     return filename, file_data, fields
 
 
+def _dir_size(p: Path) -> int:
+    try:
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def storage_by_lecture(output_dir: Path) -> dict:
+    """Group disk artifacts by source video (lecture).
+
+    A "lecture" is identified by its file-stem — the same string yt-dlp or
+    the upload handler used to write the source video. All derived artifacts
+    (slide dir, PPTX, OCR cache, review sheet) share this stem.
+
+    Returns:
+        {
+          "lectures": [
+            {
+              "key":  "M2 行動通訊安全 …",
+              "title": "M2 行動通訊安全 …",
+              "total_size": 81_815_000,
+              "items": [
+                {"type":"video","kind":"file","path":..., "size":..., "name":...},
+                {"type":"ocr_cache","kind":"file", ...},
+                {"type":"slide_dir","kind":"dir",  ...},
+                {"type":"pptx","kind":"file",     ...},
+                {"type":"pptx_reviewed","kind":"file", ...},
+              ],
+            },
+            ...
+          ],
+          "orphans": [ ... items that don't belong to any source video ... ],
+          "total_bytes": <int>,
+        }
+
+    Internal system files (`_jobs.json`, `_sheet_*.html`) are intentionally
+    omitted — the user shouldn't have to think about them, and they're
+    auto-cleaned when their owning lecture is deleted.
+    """
+    lectures: dict[str, dict] = {}
+    orphans: list[dict] = []
+
+    def _ensure(key: str) -> dict:
+        if key not in lectures:
+            lectures[key] = {"key": key, "title": key, "total_size": 0, "items": []}
+        return lectures[key]
+
+    def _stat(p: Path) -> tuple[int, float]:
+        try:
+            return (_dir_size(p) if p.is_dir() else p.stat().st_size,
+                    p.stat().st_mtime)
+        except OSError:
+            return (0, 0.0)
+
+    def _add(key: str, item_type: str, path: Path) -> None:
+        sz, mt = _stat(path)
+        item = {
+            "type": item_type,
+            "kind": "dir" if path.is_dir() else "file",
+            "path": str(path),
+            "name": path.name,
+            "size": sz,
+            "mtime": mt,
+        }
+        rec = _ensure(key)
+        rec["items"].append(item)
+        rec["total_size"] += sz
+
+    if not output_dir.exists():
+        return {"lectures": [], "orphans": [], "total_bytes": 0}
+
+    # ── 1. Pass 1: index everything in the directory ──
+    video_dir = output_dir / "_video"
+    upload_dir = output_dir / "_uploads"
+    if video_dir.is_dir():
+        for v in video_dir.iterdir():
+            if v.is_file():
+                _add(v.stem, "video", v)
+    if upload_dir.is_dir():
+        for u in upload_dir.iterdir():
+            if u.is_file():
+                _add(u.stem, "video_upload", u)
+    for entry in sorted(output_dir.iterdir()):
+        name = entry.name
+        if name in ("_video", "_uploads", "_jobs.json"):
+            continue
+        if name.startswith("_sheet_") and name.endswith(".html"):
+            continue  # system file — hidden from user
+        if name.startswith("_ocr_cache_") and name.endswith(".json"):
+            key = name[len("_ocr_cache_"):-len(".json")]
+            _add(key, "ocr_cache", entry)
+            continue
+        if entry.is_dir() and not name.startswith("_"):
+            _add(name, "slide_dir", entry)
+            continue
+        if entry.suffix.lower() == ".pptx":
+            stem = entry.stem
+            if stem.endswith("_REVIEWED"):
+                _add(stem[:-len("_REVIEWED")], "pptx_reviewed", entry)
+            else:
+                _add(stem, "pptx", entry)
+            continue
+        # Unknown file we don't recognise — treat as orphan but only if it's
+        # not a hidden/system file (already handled above)
+        if not name.startswith("_") and entry.is_file():
+            sz, mt = _stat(entry)
+            orphans.append({
+                "type": "unknown", "kind": "file",
+                "path": str(entry), "name": name, "size": sz, "mtime": mt,
+            })
+
+    # ── 2. Filter out groups with only derived files (no source video) ──
+    # If a lecture has no video AND no slide_dir AND no pptx, it's just an
+    # OCR cache from a deleted lecture — treat as orphan so user knows it's
+    # safe to remove.
+    final_lectures: list[dict] = []
+    for rec in lectures.values():
+        types = {it["type"] for it in rec["items"]}
+        has_primary = bool(types & {"video", "video_upload", "slide_dir", "pptx", "pptx_reviewed"})
+        if has_primary:
+            # Sort items into a logical order
+            order = {"video": 0, "video_upload": 0, "slide_dir": 1,
+                     "pptx": 2, "pptx_reviewed": 3, "ocr_cache": 4}
+            rec["items"].sort(key=lambda x: (order.get(x["type"], 99), x["name"]))
+            final_lectures.append(rec)
+        else:
+            orphans.extend(rec["items"])
+
+    # ── 3. Sort lectures: biggest first ──
+    final_lectures.sort(key=lambda r: r["total_size"], reverse=True)
+    orphans.sort(key=lambda i: i["size"], reverse=True)
+
+    total = sum(r["total_size"] for r in final_lectures) + sum(o["size"] for o in orphans)
+    return {
+        "lectures": final_lectures,
+        "orphans": orphans,
+        "total_bytes": total,
+    }
+
+
+def storage_inventory(output_dir: Path) -> dict[str, list[dict]]:
+    """Group every file/dir in output_dir into user-meaningful buckets.
+
+    Returns {category: [{name, path, size, mtime, kind}, ...]} where kind
+    is 'file' or 'dir' (the frontend decides icon + delete confirm text).
+    """
+    inv: dict[str, list[dict]] = {
+        "videos_downloaded": [],
+        "videos_uploaded": [],
+        "ocr_cache": [],
+        "slide_dirs": [],
+        "pptx": [],
+        "sheet_html": [],
+        "jobs_state": [],
+        "other": [],
+    }
+    if not output_dir.exists():
+        return inv
+
+    for entry in sorted(output_dir.iterdir()):
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        item = {
+            "name": entry.name,
+            "path": str(entry),
+            "size": _dir_size(entry) if entry.is_dir() else stat.st_size,
+            "mtime": stat.st_mtime,
+            "kind": "dir" if entry.is_dir() else "file",
+        }
+        if entry.name == "_video" and entry.is_dir():
+            for child in sorted(entry.iterdir()):
+                try:
+                    cstat = child.stat()
+                except OSError:
+                    continue
+                inv["videos_downloaded"].append({
+                    "name": child.name, "path": str(child),
+                    "size": cstat.st_size, "mtime": cstat.st_mtime, "kind": "file",
+                })
+        elif entry.name == "_uploads" and entry.is_dir():
+            for child in sorted(entry.iterdir()):
+                try:
+                    cstat = child.stat()
+                except OSError:
+                    continue
+                inv["videos_uploaded"].append({
+                    "name": child.name, "path": str(child),
+                    "size": cstat.st_size, "mtime": cstat.st_mtime, "kind": "file",
+                })
+        elif entry.name.startswith("_ocr_cache_") and entry.name.endswith(".json"):
+            inv["ocr_cache"].append(item)
+        elif entry.name == "_jobs.json":
+            inv["jobs_state"].append(item)
+        elif entry.name.startswith("_sheet_") and entry.name.endswith(".html"):
+            inv["sheet_html"].append(item)
+        elif entry.suffix.lower() == ".pptx":
+            inv["pptx"].append(item)
+        elif entry.is_dir() and not entry.name.startswith("_"):
+            # likely a slide output dir
+            inv["slide_dirs"].append(item)
+        else:
+            inv["other"].append(item)
+    return inv
+
+
+def safe_under(output_dir: Path, target: Path) -> bool:
+    """True if `target` resolves to a path under `output_dir`. Prevents
+    path traversal when accepting user-specified paths."""
+    try:
+        target_abs = target.resolve(strict=False)
+        output_abs = output_dir.resolve(strict=False)
+        return output_abs in target_abs.parents or target_abs == output_abs
+    except OSError:
+        return False
+
+
 def purge_job(job: Job, *, also_uploaded: bool = True) -> dict[str, list[str]]:
     """Remove a job's outputs from disk + drop it from JOBS dict.
 
@@ -436,7 +654,19 @@ THEME_CSS = """
   }
   h1 { margin: 0; font-size: 22px; font-weight: 600; }
   .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
-  main { padding: 24px; max-width: 720px; margin: 0 auto; }
+  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+  /* 2-column on desktop: form/jobs left, info/storage right */
+  .layout {
+    display: grid; gap: 28px; align-items: start;
+    grid-template-columns: 1fr;  /* mobile default */
+  }
+  @media (min-width: 980px) {
+    .layout { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+  }
+  @media (min-width: 1400px) {
+    .layout { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 36px; }
+  }
+  .col-left, .col-right { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
   form { display: flex; flex-direction: column; gap: 18px; }
   label.field { display: flex; flex-direction: column; gap: 6px; }
   label.field span { font-size: 13px; color: var(--muted); }
@@ -528,12 +758,91 @@ INDEX_HTML = f"""<!DOCTYPE html>
     margin-top: 6px; font-size: 11px; color: var(--muted);
     display: flex; gap: 10px; flex-wrap: wrap;
   }}
-  .job-card .trash {{
-    flex-shrink: 0; background: transparent; border: 1px solid #333;
-    color: var(--muted); padding: 4px 10px; border-radius: 6px;
-    cursor: pointer; font-size: 12px; line-height: 1;
+  /* job-card trash inherits the unified .trash style above */
+  /* Storage manager — lecture-centric, collapsible */
+  .lecture-card {{
+    background: var(--card); border: 1px solid #2a2a30;
+    border-radius: 8px; margin-bottom: 6px; overflow: hidden;
   }}
-  .job-card .trash:hover {{ border-color: var(--danger); color: var(--danger); }}
+  .lecture-card.orphan {{ border-color: rgba(250,204,21,0.35); background: rgba(250,204,21,0.03); }}
+  .lecture-card[open] {{ background: rgba(255,255,255,0.015); }}
+  .lecture-head {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; cursor: pointer;
+    list-style: none;  /* hide default disclosure triangle */
+  }}
+  .lecture-head::-webkit-details-marker {{ display: none; }}
+  .lecture-head:hover {{ background: rgba(255,255,255,0.025); }}
+  .lecture-caret {{
+    color: var(--muted); font-size: 10px; transition: transform .15s;
+    flex-shrink: 0; width: 12px;
+  }}
+  .lecture-card[open] .lecture-caret {{ transform: rotate(90deg); }}
+  .lecture-title {{
+    flex: 1 1 auto; min-width: 0;
+    font-size: 13px; color: var(--text); font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .lecture-count {{
+    flex-shrink: 0; font-size: 11px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }}
+  .lecture-size {{
+    flex-shrink: 0; font-size: 13px; color: var(--accent); font-weight: 600;
+    min-width: 70px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }}
+  .lecture-items {{
+    border-top: 1px solid #2a2a30; padding: 6px 10px 10px;
+    display: flex; flex-direction: column; gap: 2px;
+  }}
+  .bulk-trash {{ margin-left: 6px; }}
+  .stor-row {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 10px; border-radius: 6px;
+    transition: background .12s;
+  }}
+  .stor-row:hover {{ background: rgba(255,255,255,0.025); }}
+  .stor-row .icon {{ font-size: 15px; flex-shrink: 0; width: 20px; text-align: center; }}
+  .stor-row .stor-type {{
+    flex-shrink: 0; font-size: 11px; color: var(--accent);
+    background: rgba(74,222,128,0.08); padding: 2px 7px; border-radius: 4px;
+    min-width: 110px;
+  }}
+  .stor-row .stor-name {{
+    flex: 1; min-width: 0; font-size: 12px; color: #94a3b8;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }}
+  .stor-row .stor-size {{
+    flex-shrink: 0; font-size: 12px; color: var(--muted);
+    font-variant-numeric: tabular-nums; min-width: 70px; text-align: right;
+  }}
+  /* Unified .trash button — same style everywhere */
+  .trash, .stor-row .trash, .job-card .trash, .bulk-trash {{
+    flex-shrink: 0;
+    background: rgba(248,113,113,0.08);
+    border: 1px solid rgba(248,113,113,0.35);
+    color: var(--danger);
+    padding: 5px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1.4;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    display: inline-flex; align-items: center; gap: 4px;
+    white-space: nowrap;
+  }}
+  .trash:hover, .stor-row .trash:hover, .job-card .trash:hover, .bulk-trash:hover {{
+    background: var(--danger); color: #000; border-color: var(--danger);
+  }}
+  .stor-empty {{ color: var(--muted); font-style: italic; font-size: 12px; padding: 4px 0; }}
+  .stor-warning {{
+    border-left: 3px solid #facc15; background: rgba(250,204,21,0.05);
+    padding: 8px 12px; font-size: 12px; color: #cbd5e1; margin: 8px 0;
+    border-radius: 4px;
+  }}
 </style>
 </head><body>
 <header>
@@ -541,62 +850,76 @@ INDEX_HTML = f"""<!DOCTYPE html>
   <p class="hint">YouTube 連結 或 本機影片路徑都可以。最終輸出：PNG + PPTX。</p>
 </header>
 <main>
-  <form id="start" onsubmit="return submitForm(event)">
-    <label class="field">
-      <span>Source — 貼 YouTube URL 或本機檔案絕對路徑</span>
-      <input type="text" id="source"
-        placeholder="https://www.youtube.com/watch?v=…   或   /home/you/lecture.mp4" />
-    </label>
+  <div class="layout">
+    <div class="col-left">
+      <form id="start" onsubmit="return submitForm(event)">
+        <label class="field">
+          <span>Source — 貼 YouTube URL 或本機檔案絕對路徑</span>
+          <input type="text" id="source"
+            placeholder="https://www.youtube.com/watch?v=…   或   /home/you/lecture.mp4" />
+        </label>
 
-    <div id="drop-zone" style="
-      border: 2px dashed #333; border-radius: 10px;
-      padding: 24px; text-align: center; cursor: pointer;
-      background: rgba(255,255,255,0.02); color: var(--muted);
-      transition: border-color .15s, background .15s; font-size: 13px;
-    ">
-      <strong style="display:block;color:var(--text);margin-bottom:4px;">或 — 把影片檔拖到這裡</strong>
-      <span>（也可以點這裡選檔，影片只會傳到本機 server，不會上雲）</span>
-      <input type="file" id="file-input" accept="video/*" style="display:none" />
+        <div id="drop-zone" style="
+          border: 2px dashed #333; border-radius: 10px;
+          padding: 24px; text-align: center; cursor: pointer;
+          background: rgba(255,255,255,0.02); color: var(--muted);
+          transition: border-color .15s, background .15s; font-size: 13px;
+        ">
+          <strong style="display:block;color:var(--text);margin-bottom:4px;">或 — 把影片檔拖到這裡</strong>
+          <span>（也可以點這裡選檔，影片只會傳到本機 server，不會上雲）</span>
+          <input type="file" id="file-input" accept="video/*" style="display:none" />
+        </div>
+
+        <div class="modes">
+          <label>
+            <input type="radio" name="mode" value="auto" checked />
+            <strong>Auto</strong>
+            <small>最快，演算法直接出 PPTX（約 95% 準確）</small>
+          </label>
+          <label>
+            <input type="radio" name="mode" value="review" />
+            <strong>Review</strong>
+            <small>過收所有候選，你目視勾完再生成 PPTX</small>
+          </label>
+        </div>
+        <button type="submit" id="go">開始抓 slide</button>
+      </form>
+
+      <section id="jobs-section" style="display: none;">
+        <h2 style="font-size: 16px; margin: 0 0 12px;">📋 你的工作列表</h2>
+        <p class="hint" style="margin-top:-4px;">最近抓過的影片；點任何一張卡片回到該 job 的進度頁。本頁自動更新。</p>
+        <div id="jobs-list" style="display: flex; flex-direction: column; gap: 10px; margin-top: 12px;"></div>
+      </section>
     </div>
 
-    <div class="modes">
-      <label>
-        <input type="radio" name="mode" value="auto" checked />
-        <strong>Auto</strong>
-        <small>最快，演算法直接出 PPTX（約 95% 準確）</small>
-      </label>
-      <label>
-        <input type="radio" name="mode" value="review" />
-        <strong>Review</strong>
-        <small>過收所有候選，你目視勾完再生成 PPTX</small>
-      </label>
-    </div>
-    <button type="submit" id="go">開始抓 slide</button>
-  </form>
+    <div class="col-right">
+      <div class="scope">
+        <h3>適用範圍</h3>
+        <div><strong style="color: var(--accent)">✓ 設計給</strong>：螢幕錄製的 PowerPoint/Keynote/Google Slides 講演、技術分享、線上課程等「以靜態投影片為主」的影片（中文 + 英文）。</div>
+        <ul>
+          <li>🟡 邊緣案例（會出但可能要 review 模式）：簡報帶講者小視窗、頁面有嵌入短片、code-heavy 文字稀疏、非中英文（用 <code>--lang</code> 切換 OCR）。</li>
+          <li>✗ 不適用：白板/手寫教學、軟體 demo 螢幕錄製、純講者頭像無投影片、Prezi 平滑縮放、影片少於 30 秒。</li>
+        </ul>
+      </div>
 
-  <div style="margin-top: 28px; display: flex; flex-direction: column; gap: 14px;">
-    <div class="scope">
-      <h3>適用範圍</h3>
-      <div><strong style="color: var(--accent)">✓ 設計給</strong>：螢幕錄製的 PowerPoint/Keynote/Google Slides 講演、技術分享、線上課程等「以靜態投影片為主」的影片（中文 + 英文）。</div>
-      <ul>
-        <li>🟡 邊緣案例（會出但可能要 review 模式）：簡報帶講者小視窗、頁面有嵌入短片、code-heavy 文字稀疏、非中英文（用 <code>--lang</code> 切換 OCR）。</li>
-        <li>✗ 不適用：白板/手寫教學、軟體 demo 螢幕錄製、純講者頭像無投影片、Prezi 平滑縮放、影片少於 30 秒。</li>
-      </ul>
-    </div>
+      <div class="notice">
+        <h3>⚠ 著作權聲明 · Copyright</h3>
+        本工具僅供<strong>個人學習用途</strong>。使用者必須擁有影片內容的合法存取權限，並遵守原內容的著作權條款與平台服務條款。<br>
+        請<strong>勿</strong>用於：(1) 重製、傳播他人受著作權保護的內容；(2) 商業性質的二次利用；(3) 違反平台 ToS 的行為。<br>
+        <span style="color: var(--muted)">本工具完全在本機運作，不上傳任何影片或截圖到外部伺服器。</span>
+      </div>
 
-    <div class="notice">
-      <h3>⚠ 著作權聲明 · Copyright</h3>
-      本工具僅供<strong>個人學習用途</strong>。使用者必須擁有影片內容的合法存取權限，並遵守原內容的著作權條款與平台服務條款。<br>
-      請<strong>勿</strong>用於：(1) 重製、傳播他人受著作權保護的內容；(2) 商業性質的二次利用；(3) 違反平台 ToS 的行為。<br>
-      <span style="color: var(--muted)">本工具完全在本機運作，不上傳任何影片或截圖到外部伺服器。</span>
+      <section id="storage-section">
+        <details>
+          <summary style="cursor: pointer; padding: 14px 0; font-size: 16px; font-weight: 600;">
+            💾 儲存管理 <span id="storage-total" style="color: var(--muted); font-size: 13px; font-weight: normal;"></span>
+          </summary>
+          <p class="hint" style="margin-top:4px;">所有檔案（影片、OCR 快取、投影片、PPTX 等）一覽。逐項刪除，立即釋放空間。</p>
+          <div id="storage-list" style="margin-top: 12px;">載入中…</div>
+        </details>
+      </section>
     </div>
   </div>
-
-  <section id="jobs-section" style="margin-top: 32px; display: none;">
-    <h2 style="font-size: 16px; margin: 0 0 12px;">📋 你的工作列表</h2>
-    <p class="hint" style="margin-top:-4px;">最近抓過的影片；點任何一張卡片回到該 job 的進度頁。本頁自動更新。</p>
-    <div id="jobs-list" style="display: flex; flex-direction: column; gap: 10px; margin-top: 12px;"></div>
-  </section>
 </main>
 <footer>
   Slide Extractor · 個人學習工具 · 請尊重原作者著作權
@@ -711,7 +1034,7 @@ async function renderJobs() {{
       : (j.error ? '❌ ' + j.error : `${{j.progress_label || ''}} · ${{timeAgo(j.created_at)}}`);
     const canDelete = TERMINAL.includes(j.status);
     const trashBtn = canDelete
-      ? `<button class="trash" onclick="event.preventDefault(); event.stopPropagation(); deleteJob('${{j.id}}', '${{shortenSource(j.source).replace(/'/g, "\\\\'")}}')" title="刪除這個 job（保留 OCR cache）">🗑</button>`
+      ? `<button class="trash" onclick="event.preventDefault(); event.stopPropagation(); deleteJob('${{j.id}}', '${{shortenSource(j.source).replace(/'/g, "\\\\'")}}')" title="刪除這個 job（保留 OCR cache）">🗑 刪除</button>`
       : '';
     return `
       <a class="job-card" href="/job/${{j.id}}">
@@ -732,7 +1055,126 @@ async function deleteJob(id, label) {{
   const data = await r.json();
   if (!data.ok) {{ alert('刪除失敗：' + data.error); return; }}
   renderJobs();
+  renderStorage();
 }}
+
+const ITEM_TYPE = {{
+  video:          {{ icon: '📹', label: '原始影片（下載）' }},
+  video_upload:   {{ icon: '⬆',  label: '原始影片（上傳）' }},
+  slide_dir:      {{ icon: '🖼', label: '投影片 PNG 資料夾' }},
+  pptx:           {{ icon: '📊', label: 'Auto PPTX' }},
+  pptx_reviewed:  {{ icon: '✏', label: 'Reviewed PPTX' }},
+  ocr_cache:      {{ icon: '🧠', label: 'OCR 快取' }},
+  unknown:        {{ icon: '📁', label: '未知檔案' }},
+}};
+function fmtSize(b) {{
+  if (b < 1024) return b + ' B';
+  if (b < 1024*1024) return (b/1024).toFixed(0) + ' KB';
+  if (b < 1024*1024*1024) return (b/1024/1024).toFixed(1) + ' MB';
+  return (b/1024/1024/1024).toFixed(2) + ' GB';
+}}
+async function renderStorage() {{
+  let r;
+  try {{ r = await fetch('/api/storage'); }} catch (e) {{ return; }}
+  const data = await r.json();
+  const container = document.getElementById('storage-list');
+  const totalSpan = document.getElementById('storage-total');
+  totalSpan.textContent = '· 共 ' + fmtSize(data.total_bytes);
+
+  const lectures = data.lectures || [];
+  const orphans = data.orphans || [];
+  if (lectures.length === 0 && orphans.length === 0) {{
+    container.innerHTML = '<p class="stor-empty">沒有任何儲存中的影片。</p>';
+    return;
+  }}
+
+  const renderItem = (it) => {{
+    const meta = ITEM_TYPE[it.type] || {{ icon: '📁', label: it.type }};
+    return `<div class="stor-row">
+      <span class="icon" title="${{meta.label}}">${{meta.icon}}</span>
+      <span class="stor-type">${{meta.label}}</span>
+      <span class="stor-name" title="${{it.path.replace(/"/g,'&quot;')}}">${{it.name}}</span>
+      <span class="stor-size">${{fmtSize(it.size)}}</span>
+      <button class="trash" onclick="deletePath('${{it.path.replace(/'/g, "\\\\'")}}', '${{it.name.replace(/'/g, "\\\\'")}}')">🗑 刪除</button>
+    </div>`;
+  }};
+
+  const lectureCards = lectures.map(L => {{
+    const paths = L.items.map(it => it.path);
+    const itemsHtml = L.items.map(renderItem).join('');
+    return `<details class="lecture-card">
+      <summary class="lecture-head">
+        <span class="lecture-caret">▸</span>
+        <span class="lecture-title" title="${{L.title.replace(/"/g,'&quot;')}}">🎬 ${{L.title}}</span>
+        <span class="lecture-count">${{L.items.length}} 個檔案</span>
+        <span class="lecture-size">${{fmtSize(L.total_size)}}</span>
+        <button class="trash bulk-trash" onclick='event.preventDefault(); deleteLecture(${{JSON.stringify(L.title)}}, ${{JSON.stringify(paths)}}, ${{L.total_size}})'>🗑 刪除</button>
+      </summary>
+      <div class="lecture-items">${{itemsHtml}}</div>
+    </details>`;
+  }}).join('');
+
+  const orphanSection = orphans.length > 0
+    ? `<details class="lecture-card orphan">
+        <summary class="lecture-head">
+          <span class="lecture-caret">▸</span>
+          <span class="lecture-title">⚠ 孤兒檔案（找不到對應的影片）</span>
+          <span class="lecture-count">${{orphans.length}} 個檔案</span>
+          <span class="lecture-size">${{fmtSize(orphans.reduce((s,o)=>s+o.size, 0))}}</span>
+          <button class="trash bulk-trash" onclick='event.preventDefault(); deleteOrphans(${{JSON.stringify(orphans.map(o=>o.path))}})'>🗑 刪除</button>
+        </summary>
+        <div class="lecture-items">${{orphans.map(renderItem).join('')}}</div>
+      </details>` : '';
+
+  container.innerHTML = lectureCards + orphanSection;
+}}
+
+async function deletePath(path, name) {{
+  if (!confirm(`刪除單一檔案：「${{name}}」？\\n\\n這個動作無法復原。`)) return;
+  const r = await fetch('/api/storage/delete', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ paths: [path] }})
+  }});
+  const data = await r.json();
+  if (!data.ok) {{ alert('刪除失敗：' + data.error); return; }}
+  renderStorage();
+  renderJobs();
+}}
+
+async function deleteLecture(title, paths, totalSize) {{
+  const sz = totalSize < 1024*1024
+    ? (totalSize/1024).toFixed(0) + ' KB'
+    : totalSize < 1024*1024*1024
+      ? (totalSize/1024/1024).toFixed(1) + ' MB'
+      : (totalSize/1024/1024/1024).toFixed(2) + ' GB';
+  if (!confirm(`刪除「${{title}}」整部？\\n\\n會清掉這部 lecture 所有相關檔案（${{paths.length}} 個，共 ${{sz}}）：\\n  · 原始影片\\n  · 投影片 PNG\\n  · PPTX\\n  · OCR 快取\\n\\n這個動作無法復原。`)) return;
+  const r = await fetch('/api/storage/delete', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ paths }})
+  }});
+  const data = await r.json();
+  if (!data.ok) {{ alert('刪除失敗：' + data.error); return; }}
+  if (data.denied && data.denied.length) {{ alert('部分失敗：' + data.denied.join('\\n')); }}
+  renderStorage();
+  renderJobs();
+}}
+
+async function deleteOrphans(paths) {{
+  if (!confirm(`清除所有 ${{paths.length}} 個孤兒檔案？\\n\\n這些檔案找不到對應的原始影片。`)) return;
+  const r = await fetch('/api/storage/delete', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ paths }})
+  }});
+  const data = await r.json();
+  if (!data.ok) {{ alert('刪除失敗：' + data.error); return; }}
+  renderStorage();
+  renderJobs();
+}}
+renderStorage();
+setInterval(renderStorage, 10000);
 renderJobs();
 setInterval(renderJobs, 2000);
 </script>
@@ -993,6 +1435,10 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     return
                 self.send_error(404)
                 return
+            if path == "/api/storage":
+                data = storage_by_lecture(output_dir)
+                self._send_json(200, {"ok": True, **data})
+                return
             if path == "/api/jobs":
                 with JOBS_LOCK:
                     summaries = [
@@ -1102,6 +1548,32 @@ def make_handler(output_dir: Path) -> type[http.server.BaseHTTPRequestHandler]:
                     return
                 job.cancel_event.set()
                 self._send_json(200, {"ok": True, "status": "cancelling"})
+                return
+            if path == "/api/storage/delete":
+                try:
+                    body = json.loads(self._read_body())
+                    paths = body.get("paths", [])
+                    if not isinstance(paths, list) or not paths:
+                        self._send_json(400, {"ok": False, "error": "paths list required"})
+                        return
+                    removed, denied = [], []
+                    for raw in paths:
+                        p = Path(str(raw))
+                        if not safe_under(output_dir, p):
+                            denied.append(str(p)); continue
+                        if not p.exists():
+                            continue  # already gone
+                        try:
+                            if p.is_dir():
+                                shutil.rmtree(p)
+                            else:
+                                p.unlink()
+                            removed.append(str(p))
+                        except OSError as e:
+                            denied.append(f"{p}: {e}")
+                    self._send_json(200, {"ok": True, "removed": removed, "denied": denied})
+                except Exception as e:  # noqa: BLE001
+                    self._send_json(500, {"ok": False, "error": str(e)})
                 return
             if path.startswith("/api/job/") and path.endswith("/delete"):
                 jid = path[len("/api/job/"):-len("/delete")]

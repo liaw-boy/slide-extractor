@@ -350,6 +350,58 @@ def t12_multipart_upload():
         p.unlink(missing_ok=True)
 
 
+def t15_storage_inventory_api():
+    """GET /api/storage returns lecture-grouped inventory (per-lecture cards)."""
+    print("\n[T15] Storage inventory API — lecture-grouped")
+    code, body = http_json("GET", "/api/storage")
+    check("/api/storage returns 200 + ok", code == 200 and body.get("ok"))
+    check("response has 'lectures' list", isinstance(body.get("lectures"), list))
+    check("response has 'orphans' list", isinstance(body.get("orphans"), list))
+    check("total_bytes is int", isinstance(body.get("total_bytes"), int))
+    if body.get("lectures"):
+        L = body["lectures"][0]
+        check("lecture has key", "key" in L)
+        check("lecture has title", "title" in L)
+        check("lecture has total_size", isinstance(L.get("total_size"), int))
+        check("lecture has items list", isinstance(L.get("items"), list))
+        check("biggest lecture first", body["lectures"][0]["total_size"]
+              >= body["lectures"][-1]["total_size"])
+    # Verify system files are NOT exposed
+    all_paths = []
+    for L in body.get("lectures", []):
+        all_paths.extend(it["path"] for it in L["items"])
+    all_paths.extend(it["path"] for it in body.get("orphans", []))
+    no_sheet_html = not any("_sheet_" in p for p in all_paths)
+    no_jobs_json = not any(p.endswith("_jobs.json") for p in all_paths)
+    check("system file _sheet_*.html hidden from user", no_sheet_html)
+    check("system file _jobs.json hidden from user", no_jobs_json)
+
+
+def t16_storage_delete_path_safety():
+    """POST /api/storage/delete refuses paths outside output_dir (path traversal)."""
+    print("\n[T16] Storage delete — path safety")
+    # try to delete /etc/passwd
+    code, body = http_json("POST", "/api/storage/delete", {"paths": ["/etc/passwd"]})
+    check("delete rejects out-of-tree path",
+          code == 200 and body.get("ok") and len(body.get("removed", [])) == 0
+          and len(body.get("denied", [])) > 0,
+          f"removed={body.get('removed')} denied={body.get('denied')}")
+    # empty paths list
+    code, body = http_json("POST", "/api/storage/delete", {"paths": []})
+    check("empty paths list returns 400", code == 400)
+
+
+def t17_storage_delete_real_file():
+    """Create a throw-away sheet file, then delete via API and verify it's gone."""
+    print("\n[T17] Storage delete — real file deletion")
+    victim = OUTPUT_DIR / f"_sheet_smoketestvictim{uuid.uuid4().hex[:6]}.html"
+    victim.write_text("dummy")
+    code, body = http_json("POST", "/api/storage/delete", {"paths": [str(victim)]})
+    check("delete returns ok", code == 200 and body.get("ok"))
+    check("victim file in removed list", str(victim) in body.get("removed", []))
+    check("victim file actually gone", not victim.exists())
+
+
 def t14_delete_job():
     """Job deletion — removes from dashboard + nukes output files,
     keeps OCR cache so re-processing is still fast."""
@@ -459,6 +511,9 @@ def main() -> int:
         t12_multipart_upload()
         t13_multipart_rejects_missing_file()
         t14_delete_job()
+        t15_storage_inventory_api()
+        t16_storage_delete_path_safety()
+        t17_storage_delete_real_file()
         before_ids = t10_persistence_across_restart(jid)
     finally:
         stop_server(proc)
